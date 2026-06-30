@@ -19,9 +19,9 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-const char* ssid = "TU_WIFI";
-const char* password = "TU_PASSWORD";
-const char* serverUrl = "http://192.168.1.100:8000/reconocimiento";
+const char* ssid = "PEINE-2";
+const char* password = "etecPeine2";
+const char* serverUrl = "http://10.56.2.32:8000/reconocimiento";
 
 void setupCamera() {
   camera_config_t config;
@@ -121,5 +121,5 @@ void setup() {
 
 void loop() {
   enviarFoto();
-  delay(5000);
+  delay(1000);
 }
