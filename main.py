@@ -24,6 +24,8 @@ app = FastAPI(lifespan=lifespan)
 async def reconocimiento(file: UploadFile = File(...)):
     contenido = await file.read()
     imagen_pil = Image.open(io.BytesIO(contenido)).convert("RGB")
+    imagen_pil.save("ultima_foto_recibida.jpg")
+
     imagen_np = np.array(imagen_pil)
 
     try:
