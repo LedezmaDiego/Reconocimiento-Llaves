@@ -11,7 +11,7 @@
         #define Y8_GPIO_NUM       34
         #define Y7_GPIO_NUM       39
         #define Y6_GPIO_NUM       36
-        #define Y5_GPIO_NUM       21
+        #define Y5_GPIO_NUM       21  
         #define Y4_GPIO_NUM       19
         #define Y3_GPIO_NUM       18
         #define Y2_GPIO_NUM        5
@@ -20,8 +20,8 @@
         #define PCLK_GPIO_NUM     22
 
 
-        const char* ssid = "sanlorenzo";
-        const char* password = "48184546#$";
+        const char* ssid = "Peine-2";
+        const char* password = "etecPeine2";
         const char* serverUrl = "http://192.168.1.6:8000/reconocimiento";
         //const char* ssid = "PEINE-2";
         //const char* password = "etecPeine2";
