@@ -1,0 +1,2 @@
+const char* ssid     = "Telecentro-cd93";
+const char* password = "UHX63RCRHF3U";

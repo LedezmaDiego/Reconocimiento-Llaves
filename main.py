@@ -3,9 +3,11 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from deepface import DeepFace
 from contextlib import closing
+import numpy as np
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 import uvicorn
@@ -16,13 +18,20 @@ app = FastAPI()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DIRECTORIO_CARAS = os.path.join(BASE_DIR, "personas_autorizadas")
 DB_PATH = os.path.join(BASE_DIR, "llaves.db")
+EXTENSIONES = (".jpg", ".jpeg", ".png")
 
-DETECTOR = "yunet"          # si no detecta caras, probar: "retinaface", "mediapipe", "opencv"
-EXIGIR_ROSTRO = True        # False = no verificar que haya una cara antes de comparar
+MODELO = "VGG-Face"
+DETECTOR = "yunet"          # si no detecta caras, probar "retinaface"
+UMBRAL = 0.40               # distancia coseno máxima para aceptar (menor = más estricto)
+EXIGIR_ROSTRO = True        # False = no exigir que se detecte una cara en la foto entrante
 VENTANA_RETIRO_S = 60       # segundos que vale una autorización facial para asociar un retiro
 
 # {casillero_id: (persona, timestamp)}
 ULTIMA_AUTORIZACION: dict[str, tuple[str, float]] = {}
+
+# {archivo: {"mtime": float, "emb": np.ndarray, "persona": str}}
+BASE_EMBEDDINGS: dict[str, dict] = {}
+LOCK_BASE = threading.Lock()
 
 
 def obtener_hora():
@@ -71,59 +80,106 @@ def registrar_estado(casillero_id: str, estado: str, evento: str, persona: str |
             (casillero_id, evento, persona, ahora))
 
 
+# ============================ RECONOCIMIENTO ============================
+def nombre_persona(archivo: str) -> str:
+    return re.sub(r"\d+", "", archivo.split(".")[0]).capitalize()
+
+
+def calcular_embedding(ruta: str, exigir_rostro: bool) -> np.ndarray:
+    """Devuelve el embedding de la cara más grande de la imagen.
+    Lanza ValueError si exigir_rostro=True y no hay ninguna cara."""
+    res = DeepFace.represent(
+        img_path=ruta,
+        model_name=MODELO,
+        detector_backend=DETECTOR,
+        enforce_detection=exigir_rostro,
+    )
+
+    def area(r):
+        fa = r.get("facial_area", {})
+        return fa.get("w", 0) * fa.get("h", 0)
+
+    mejor = max(res, key=area)
+    return np.array(mejor["embedding"], dtype=np.float32)
+
+
+def distancia_coseno(a: np.ndarray, b: np.ndarray) -> float:
+    return float(1.0 - np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
+
+
+def sincronizar_base():
+    """Calcula (una sola vez) el embedding de cada foto de referencia.
+    Detecta fotos nuevas, modificadas o borradas sin reiniciar el servidor."""
+    with LOCK_BASE:
+        if not os.path.exists(DIRECTORIO_CARAS):
+            os.makedirs(DIRECTORIO_CARAS)
+
+        archivos = {f for f in os.listdir(DIRECTORIO_CARAS) if f.lower().endswith(EXTENSIONES)}
+
+        for f in list(BASE_EMBEDDINGS):
+            if f not in archivos:
+                del BASE_EMBEDDINGS[f]
+                print(f"[{obtener_hora()}] [BASE] Foto eliminada: {f}")
+
+        for f in sorted(archivos):
+            ruta = os.path.join(DIRECTORIO_CARAS, f)
+            mtime = os.path.getmtime(ruta)
+            if f in BASE_EMBEDDINGS and BASE_EMBEDDINGS[f]["mtime"] == mtime:
+                continue
+            try:
+                emb = calcular_embedding(ruta, exigir_rostro=True)
+                BASE_EMBEDDINGS[f] = {"mtime": mtime, "emb": emb, "persona": nombre_persona(f)}
+                print(f"[{obtener_hora()}] [BASE] Cargada: {f} -> {nombre_persona(f)}")
+            except Exception as e:
+                BASE_EMBEDDINGS.pop(f, None)
+                print(f"[{obtener_hora()}] [ADVERTENCIA] {f} ignorada (sin cara detectable o corrupta): {str(e)[:80]}")
+
+
+def comparar_rostro(ruta_temp: str) -> dict:
+    """Bloqueante (DeepFace). Se ejecuta en un hilo aparte."""
+    sincronizar_base()
+
+    if not BASE_EMBEDDINGS:
+        return {"vacia": True}
+
+    try:
+        emb = calcular_embedding(ruta_temp, exigir_rostro=EXIGIR_ROSTRO)
+    except ValueError:
+        return {"rostro": False, "autorizado": False, "persona": "Desconocido", "distancia": None}
+
+    mejor_dist = 999.0
+    mejor_persona = "Desconocido"
+    with LOCK_BASE:
+        for f, datos in BASE_EMBEDDINGS.items():
+            d = distancia_coseno(emb, datos["emb"])
+            if d < mejor_dist:
+                mejor_dist = d
+                mejor_persona = datos["persona"]
+
+    autorizado = mejor_dist <= UMBRAL
+    return {
+        "rostro": True,
+        "autorizado": autorizado,
+        "persona": mejor_persona if autorizado else "Desconocido",
+        "distancia": mejor_dist,
+        "mas_parecido": mejor_persona,
+    }
+
+
 # ============================ STARTUP ============================
 @app.on_event("startup")
 async def startup_event():
     init_db()
     print("\n" + "=" * 60)
-    print(f"[{obtener_hora()}] [SISTEMA] Iniciando Servidor sin caché (Modo Seguro)")
-
-    if os.path.exists(DIRECTORIO_CARAS):
-        fotos = [f for f in os.listdir(DIRECTORIO_CARAS) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        if fotos:
-            print(f"[{obtener_hora()}] [SISTEMA] ¡Éxito! {len(fotos)} fotos válidas encontradas: {fotos}")
-        else:
-            print(f"[{obtener_hora()}] [ALERTA] La carpeta existe pero no tiene imágenes válidas.")
-    else:
-        os.makedirs(DIRECTORIO_CARAS)
-    print(f"[{obtener_hora()}] [SISTEMA] Detector de rostros: {DETECTOR}")
+    print(f"[{obtener_hora()}] [SISTEMA] Iniciando servidor | modelo={MODELO} detector={DETECTOR} umbral={UMBRAL}")
+    print(f"[{obtener_hora()}] [SISTEMA] Cargando fotos de referencia (la primera vez descarga modelos)...")
+    await run_in_threadpool(sincronizar_base)
+    personas = sorted({d["persona"] for d in BASE_EMBEDDINGS.values()})
+    print(f"[{obtener_hora()}] [SISTEMA] Listo: {len(BASE_EMBEDDINGS)} fotos válidas, personas: {personas}")
     print("=" * 60 + "\n")
 
 
-# ============================ RECONOCIMIENTO ============================
-def comparar_rostro(ruta_temp: str, fotos_db: list[str]) -> dict:
-    """Bloqueante (DeepFace). Se ejecuta en un hilo aparte."""
-    if EXIGIR_ROSTRO:
-        try:
-            DeepFace.extract_faces(img_path=ruta_temp,
-                                   detector_backend=DETECTOR,
-                                   enforce_detection=True)
-        except ValueError:
-            return {"rostro": False, "autorizado": False, "persona": "Desconocido", "distancia": None}
-
-    persona = "Desconocido"
-    mejor = 999.0
-    autorizado = False
-
-    for foto in fotos_db:
-        ruta_db = os.path.join(DIRECTORIO_CARAS, foto)
-        try:
-            r = DeepFace.verify(img1_path=ruta_temp,
-                                img2_path=ruta_db,
-                                detector_backend=DETECTOR,
-                                enforce_detection=False,
-                                silent=True)
-            if r["verified"] and r["distance"] < mejor:
-                mejor = r["distance"]
-                autorizado = True
-                persona = re.sub(r'\d+', '', foto.split('.')[0]).capitalize()
-        except Exception as e:
-            print(f"[{obtener_hora()}] [ADVERTENCIA] No se pudo analizar {foto}: {e}")
-
-    return {"rostro": True, "autorizado": autorizado, "persona": persona,
-            "distancia": mejor if autorizado else None}
-
-
+# ============================ ENDPOINTS ============================
 @app.post("/reconocimiento")
 async def reconocer_rostro(request: Request):
     casillero_id = request.headers.get("x-casillero-id", "C01")
@@ -139,21 +195,25 @@ async def reconocer_rostro(request: Request):
         with open(ruta_temp, "wb") as f:
             f.write(cuerpo)
 
-        fotos_db = [f for f in os.listdir(DIRECTORIO_CARAS) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
-        if not fotos_db:
-            return {"status": "error", "mensaje": "Carpeta de rostros vacía en el sistema."}
+        res = await run_in_threadpool(comparar_rostro, ruta_temp)
 
-        res = await run_in_threadpool(comparar_rostro, ruta_temp, fotos_db)
+        if res.get("vacia"):
+            return {"status": "error", "mensaje": "No hay fotos de referencia válidas en el sistema."}
 
         if res["autorizado"]:
             ULTIMA_AUTORIZACION[casillero_id] = (res["persona"], time.time())
-            print(f"[{obtener_hora()}] [ACCESO PERMITIDO] {res['persona']} (dist: {res['distancia']:.2f})")
+            print(f"[{obtener_hora()}] [ACCESO PERMITIDO] {res['persona']} (dist: {res['distancia']:.3f})")
             print("-" * 60)
             return {"status": "success", "autorizado": True, "persona": res["persona"],
                     "mensaje": f"Bienvenido/a, {res['persona']}.", "distancia": res["distancia"]}
 
-        motivo = "Persona no registrada." if res["rostro"] else "No se detectó ningún rostro."
-        print(f"[{obtener_hora()}] [ACCESO DENEGADO] {motivo}")
+        if res["rostro"]:
+            print(f"[{obtener_hora()}] [ACCESO DENEGADO] Persona no registrada "
+                  f"(más parecido: {res['mas_parecido']}, dist: {res['distancia']:.3f}, umbral: {UMBRAL})")
+            motivo = "Persona no registrada."
+        else:
+            print(f"[{obtener_hora()}] [SIN ROSTRO] No se detectó ninguna cara en la imagen")
+            motivo = "No se detectó ningún rostro."
         print("-" * 60)
         return {"status": "success", "autorizado": False, "persona": "Desconocido", "mensaje": motivo}
 
@@ -166,7 +226,6 @@ async def reconocer_rostro(request: Request):
             os.remove(ruta_temp)
 
 
-# ============================ US03: DEVOLUCIÓN / RETIRO ============================
 class EventoCasillero(BaseModel):
     casillero_id: str
 

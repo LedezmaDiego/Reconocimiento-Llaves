@@ -1,6 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <HTTPClient.h>
 #include "esp_camera.h"
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
@@ -8,9 +8,15 @@
 // =========================================================
 // CONFIGURACIÓN
 // =========================================================
-
 const char* ssid     = "Telecentro-cd93";
 const char* password = "UHX63RCRHF3U";
+// IP de la PC donde corre uvicorn (ver con ipconfig)
+const char* SERVER_BASE  = "http://192.168.0.122:8000";
+const char* CASILLERO_ID = "C01";
+
+const unsigned long TIEMPO_ENTRE_FOTOS    = 1500;
+const unsigned long PAUSA_TRAS_ACCESO_MS  = 5000;
+
 // Pines AI Thinker ESP32-CAM
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -29,66 +35,8 @@ const char* password = "UHX63RCRHF3U";
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-WebServer server(80);
-
-// =========================================================
-// PÁGINA WEB
-// =========================================================
-const char PAGINA[] PROGMEM = R"rawliteral(
-<!DOCTYPE html><html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Registro de rostros</title>
-<style>
-  body{font-family:sans-serif;text-align:center;background:#111;color:#eee;margin:0;padding:12px}
-  img{max-width:100%;border-radius:8px;background:#000;min-height:200px}
-  input,button{font-size:1.1em;padding:10px;margin:6px;border-radius:6px;border:0}
-  button{background:#2e7d32;color:#fff}
-</style></head><body>
-<h2>Registro de rostros - ESP32-CAM</h2>
-<img id="v" src="/capture">
-<div>
-  <input id="n" placeholder="nombre (ej: dylan)">
-  <button onclick="guardar()">Guardar foto</button>
-</div>
-<p id="m"></p>
-<script>
-let guardando = false;
-const v = document.getElementById('v');
-const m = document.getElementById('m');
-
-function refrescar(){
-  if (guardando) return;
-  v.src = '/capture?t=' + Date.now();
-}
-v.onload  = () => setTimeout(refrescar, 500);
-v.onerror = () => setTimeout(refrescar, 1000);
-
-async function guardar(){
-  const nombre = document.getElementById('n').value.trim().toLowerCase().replace(/[^a-z]/g,'');
-  if (!nombre){ m.textContent = 'Escribe un nombre (solo letras).'; return; }
-  guardando = true;
-  try {
-    const r = await fetch('/capture?t=' + Date.now());
-    if (!r.ok) throw new Error('la placa no pudo capturar (HTTP ' + r.status + ')');
-    const b = await r.blob();
-    if (b.size < 5000) throw new Error('imagen demasiado pequeña (' + b.size + ' bytes)');
-    const c = parseInt(localStorage.getItem('c_' + nombre) || '0') + 1;
-    localStorage.setItem('c_' + nombre, c);
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(b);
-    a.download = nombre + c + '.jpg';
-    a.click();
-    m.textContent = 'Guardada: ' + nombre + c + '.jpg (' + Math.round(b.size / 1024) + ' KB)';
-  } catch (e) {
-    m.textContent = 'Error: ' + e.message + '. Vuelve a intentar.';
-  }
-  guardando = false;
-  refrescar();
-}
-</script>
-</body></html>
-)rawliteral";
+unsigned long proximoEscaneo = 0;
+unsigned long ultimoIntentoWiFi = 0;
 
 // =========================================================
 // CÁMARA
@@ -117,8 +65,8 @@ bool setupCamera() {
 
   config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_VGA;   // 640x480, igual que el sistema final
-  config.jpeg_quality = 10;              // menor número = mejor calidad
+  config.frame_size   = FRAMESIZE_VGA;   // igual que el sketch de registro
+  config.jpeg_quality = 10;
   config.fb_count     = 2;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
   config.grab_mode    = CAMERA_GRAB_LATEST;
@@ -143,36 +91,82 @@ camera_fb_t* capturar() {
 }
 
 // =========================================================
-// HANDLERS
+// RED
 // =========================================================
-void handleRoot() {
-  server.send_P(200, "text/html", PAGINA);
+void setupWiFi() {
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\nWiFi OK. IP: ");
+  Serial.println(WiFi.localIP());
 }
 
-void handleCapture() {
+void mantenerWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - ultimoIntentoWiFi < 5000) return;
+  ultimoIntentoWiFi = millis();
+  Serial.println("WiFi caído. Reconectando...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+}
+
+// Extrae el valor de un campo string del JSON: "campo":"valor"
+String extraerCampo(const String& json, const String& campo) {
+  String clave = "\"" + campo + "\":\"";
+  int i = json.indexOf(clave);
+  if (i < 0) return "";
+  i += clave.length();
+  int f = json.indexOf("\"", i);
+  if (f < 0) return "";
+  return json.substring(i, f);
+}
+
+// =========================================================
+// RECONOCIMIENTO
+// =========================================================
+// Devuelve true si el rostro fue autorizado
+bool escanear() {
   camera_fb_t* fb = capturar();
   if (!fb) {
-    Serial.println("[CAPTURE] esp_camera_fb_get devolvió NULL");
-    server.send(500, "text/plain", "Error de captura");
-    return;
+    Serial.println("Error al capturar.");
+    return false;
   }
-  Serial.printf("[CAPTURE] Foto de %u bytes\n", (unsigned)fb->len);
 
-  WiFiClient client = server.client();
-  client.print("HTTP/1.1 200 OK\r\n");
-  client.print("Content-Type: image/jpeg\r\n");
-  client.printf("Content-Length: %u\r\n", (unsigned)fb->len);
-  client.print("Cache-Control: no-store\r\n");
-  client.print("Connection: close\r\n\r\n");
+  Serial.printf("Enviando foto de %u bytes...\n", (unsigned)fb->len);
 
-  size_t enviados = 0;
-  while (enviados < fb->len) {
-    size_t resto = fb->len - enviados;
-    size_t n = client.write(fb->buf + enviados, resto > 1024 ? 1024 : resto);
-    if (n == 0) break;
-    enviados += n;
+  HTTPClient http;
+  String url = String(SERVER_BASE) + "/reconocimiento";
+  http.begin(url);
+  http.setTimeout(20000);   // el servidor puede tardar unos segundos
+  http.addHeader("Content-Type", "image/jpeg");
+  http.addHeader("X-Casillero-Id", CASILLERO_ID);
+
+  int code = http.POST(fb->buf, fb->len);
+  bool autorizado = false;
+
+  if (code > 0) {
+    String resp = http.getString();
+    autorizado = resp.indexOf("\"autorizado\":true") >= 0;
+
+    if (autorizado) {
+      Serial.println("==============================");
+      Serial.println("ACCESO PERMITIDO: " + extraerCampo(resp, "persona"));
+      Serial.println("==============================");
+    } else {
+      Serial.println("Acceso denegado: " + extraerCampo(resp, "mensaje"));
+    }
+  } else {
+    Serial.printf("Error POST: %s\n", http.errorToString(code).c_str());
   }
+
+  http.end();
   esp_camera_fb_return(fb);
+  return autorizado;
 }
 
 // =========================================================
@@ -184,29 +178,26 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   Serial.println("\n=== BOOT ===");
-  Serial.printf("PSRAM: %s, tamaño: %u bytes\n", psramFound() ? "SI" : "NO", (unsigned)ESP.getPsramSize());
-  Serial.println("--- Registro de rostros ETEC ---");
+  Serial.printf("PSRAM: %s\n", psramFound() ? "SI" : "NO");
+  Serial.println("--- Llavero Inteligente ETEC: reconocimiento ---");
 
   if (!setupCamera()) {
     Serial.println("Cámara no disponible. Reinicia la placa.");
     return;
   }
-
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando a WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println();
-  Serial.print("Abre en el navegador: http://");
-  Serial.println(WiFi.localIP());
-
-  server.on("/", handleRoot);
-  server.on("/capture", handleCapture);
-  server.begin();
+  setupWiFi();
 }
 
 void loop() {
-  server.handleClient();
+  mantenerWiFi();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    delay(200);
+    return;
+  }
+
+  if (millis() < proximoEscaneo) return;
+
+  bool autorizado = escanear();
+  proximoEscaneo = millis() + (autorizado ? PAUSA_TRAS_ACCESO_MS : TIEMPO_ENTRE_FOTOS);
 }
