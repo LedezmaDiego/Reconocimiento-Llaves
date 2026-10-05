@@ -8,3 +8,8 @@ personas_autorizadas/
 *.png
 
 .vscode/
+personas_autorizadas/
+fotos_pendientes/
+llaves.db
+temp_*.jpg
+venv/

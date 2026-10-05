@@ -1,2 +1,10 @@
 const char* ssid     = "Telecentro-cd93";
 const char* password = "UHX63RCRHF3U";
+
+
+
+
+const char* ssid         = "PEINE-3";
+const char* password     = "etecPeine3";
+const char* serverUrl    = "http://10.56.13.16:8000/reconocimiento";
+const char* CASILLERO_ID = "C01";
