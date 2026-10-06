@@ -9,6 +9,7 @@ import hmac
 import numpy as np
 import os
 import re
+import requests
 import secrets
 import sqlite3
 import threading
@@ -39,6 +40,14 @@ CLAVE_ADMIN = os.environ.get("ADMIN_CLAVE", "cambiame-admin")
 ADMIN_SOLO_LOCAL = False    # True = el panel /admin solo se abre desde esta misma PC
 ADMIN_SESION_S = 1800
 MAX_PENDIENTES = 20         # tope de solicitudes sin resolver (evita spam)
+
+# ---------------- PocketBase (guarda los usuarios) ----------------
+# El servidor entra como superusuario de PocketBase. Definí estas variables:
+#   PB_EMAIL y PB_PASSWORD = el superusuario que creaste en PocketBase
+PB_URL = os.environ.get("PB_URL", "http://127.0.0.1:8090")
+PB_EMAIL = os.environ.get("PB_EMAIL", "")
+PB_PASSWORD = os.environ.get("PB_PASSWORD", "")
+COLECCION = "personal"
 
 # ---------------- Usuarios ----------------
 MAX_FOTOS_POR_USUARIO = 15
@@ -86,13 +95,7 @@ def init_db():
         con.execute("""CREATE TABLE IF NOT EXISTS historial (
             id INTEGER PRIMARY KEY AUTOINCREMENT, casillero_id TEXT NOT NULL,
             evento TEXT NOT NULL, persona TEXT, fecha TEXT NOT NULL)""")
-        con.execute("""CREATE TABLE IF NOT EXISTS usuarios (
-            usuario TEXT PRIMARY KEY, salt BLOB NOT NULL, pin_hash BLOB NOT NULL,
-            creado TEXT NOT NULL, estado TEXT NOT NULL DEFAULT 'pendiente')""")
-        # Migración: los usuarios que ya existían quedan aprobados
-        cols = [r["name"] for r in con.execute("PRAGMA table_info(usuarios)")]
-        if "estado" not in cols:
-            con.execute("ALTER TABLE usuarios ADD COLUMN estado TEXT NOT NULL DEFAULT 'aprobado'")
+        # Los usuarios ya no se guardan acá: viven en PocketBase (ver más abajo)
 
 
 def registrar_estado(casillero_id: str, estado: str, evento: str, persona: str | None = None):
@@ -119,10 +122,83 @@ def hash_pin(pin: str, salt: bytes) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, 100_000)
 
 
+# ---- Cliente de PocketBase ----
+_PB = {"token": None}
+LOCK_PB = threading.Lock()
+_CACHE_ESTADO: dict[str, tuple[str | None, float]] = {}   # evita consultar PocketBase en cada request
+
+
+def pb_login():
+    r = requests.post(f"{PB_URL}/api/collections/_superusers/auth-with-password",
+                      json={"identity": PB_EMAIL, "password": PB_PASSWORD}, timeout=5)
+    r.raise_for_status()
+    _PB["token"] = r.json()["token"]
+
+
+def pb(metodo: str, ruta: str, **kw) -> requests.Response:
+    """Llamada a PocketBase con el token de superusuario (se renueva solo)."""
+    try:
+        for intento in (1, 2):
+            if not _PB["token"]:
+                with LOCK_PB:
+                    if not _PB["token"]:
+                        pb_login()
+            r = requests.request(metodo, f"{PB_URL}{ruta}", headers={"Authorization": _PB["token"]},
+                                 timeout=5, **kw)
+            if r.status_code in (401, 403) and intento == 1:
+                _PB["token"] = None
+                continue
+            return r
+    except requests.RequestException as e:
+        print(f"[{obtener_hora()}] [POCKETBASE] No disponible o credenciales inválidas: {str(e)[:100]}")
+        raise HTTPException(status_code=503, detail="La base de datos de usuarios no está disponible.")
+
+
+def pb_usuario(usuario: str) -> dict | None:
+    if not re.fullmatch(r"[a-z]{3,20}", usuario or ""):   # también evita inyección en el filtro
+        return None
+    r = pb("GET", f"/api/collections/{COLECCION}/records",
+           params={"filter": f'usuario="{usuario}"', "perPage": 1})
+    if r.status_code != 200:
+        raise HTTPException(status_code=503, detail="La base de datos de usuarios no está disponible.")
+    items = r.json().get("items", [])
+    return items[0] if items else None
+
+
+def asegurar_coleccion():
+    """Crea la colección 'personal' en PocketBase si todavía no existe."""
+    r = pb("GET", f"/api/collections/{COLECCION}")
+    if r.status_code == 200:
+        return
+    esquema = {
+        "name": COLECCION, "type": "base",
+        "fields": [
+            {"name": "usuario", "type": "text", "required": True},
+            {"name": "salt", "type": "text", "required": True},
+            {"name": "pin_hash", "type": "text", "required": True},
+            {"name": "estado", "type": "select", "required": True, "maxSelect": 1,
+             "values": ["pendiente", "aprobado", "rechazado"]},
+            {"name": "creado", "type": "text"},
+        ],
+        "indexes": [f"CREATE UNIQUE INDEX idx_{COLECCION}_usuario ON {COLECCION} (usuario)"],
+        # Sin reglas (null) = solo superusuarios: nadie puede leerla desde fuera del servidor
+        "listRule": None, "viewRule": None, "createRule": None, "updateRule": None, "deleteRule": None,
+    }
+    r = pb("POST", "/api/collections", json=esquema)
+    if r.status_code in (200, 201):
+        print(f"[{obtener_hora()}] [POCKETBASE] Colección '{COLECCION}' creada")
+    else:
+        print(f"[{obtener_hora()}] [POCKETBASE] No pude crear la colección: {r.status_code} {r.text[:200]}")
+
+
 def estado_de(usuario: str) -> str | None:
-    with closing(db()) as con:
-        f = con.execute("SELECT estado FROM usuarios WHERE usuario = ?", (usuario,)).fetchone()
-    return f["estado"] if f else None
+    c = _CACHE_ESTADO.get(usuario)
+    if c and c[1] > time.time():
+        return c[0]
+    rec = pb_usuario(usuario)
+    est = rec["estado"] if rec else None
+    _CACHE_ESTADO[usuario] = (est, time.time() + 2)
+    return est
 
 
 def controlar_bloqueo(clave: str):
@@ -144,9 +220,9 @@ def registrar_fallo(clave: str):
 def verificar_pin(usuario: str, pin: str) -> bool:
     usuario = normalizar_usuario(usuario)
     controlar_bloqueo(usuario)
-    with closing(db()) as con:
-        fila = con.execute("SELECT salt, pin_hash FROM usuarios WHERE usuario = ?", (usuario,)).fetchone()
-    ok = bool(fila) and hmac.compare_digest(hash_pin(pin or "", fila["salt"]), fila["pin_hash"])
+    fila = pb_usuario(usuario)
+    ok = bool(fila) and hmac.compare_digest(hash_pin(pin or "", bytes.fromhex(fila["salt"])),
+                                            bytes.fromhex(fila["pin_hash"]))
     if ok:
         INTENTOS.pop(usuario, None)
         return True
@@ -376,6 +452,10 @@ def worker_pendientes():
 @app.on_event("startup")
 async def startup_event():
     init_db()
+    try:
+        await run_in_threadpool(asegurar_coleccion)
+    except HTTPException:
+        print(f"[{obtener_hora()}] [POCKETBASE] ¡No pude conectar! Revisá PB_URL, PB_EMAIL y PB_PASSWORD.")
     os.makedirs(DIRECTORIO_CARAS, exist_ok=True)
     os.makedirs(DIRECTORIO_PENDIENTES, exist_ok=True)
     for f in os.listdir(DIRECTORIO_PENDIENTES):
@@ -488,18 +568,22 @@ async def solicitar_acceso(datos: SolicitudAcceso):
     if not re.fullmatch(r"\d{4,8}", datos.pin):
         raise HTTPException(status_code=400, detail="El código personal debe tener de 4 a 8 números")
 
-    with closing(db()) as con:
-        n = con.execute("SELECT COUNT(*) FROM usuarios WHERE estado = 'pendiente'").fetchone()[0]
-    if n >= MAX_PENDIENTES:
+    r = pb("GET", f"/api/collections/{COLECCION}/records",
+           params={"filter": 'estado="pendiente"', "perPage": 1})
+    if r.status_code == 200 and r.json().get("totalItems", 0) >= MAX_PENDIENTES:
         raise HTTPException(status_code=429, detail="Hay demasiadas solicitudes pendientes. Avisá al administrador.")
+    if pb_usuario(usuario):
+        raise HTTPException(status_code=409, detail="Ese usuario ya existe")
 
     salt = os.urandom(16)
-    try:
-        with closing(db()) as con, con:
-            con.execute("INSERT INTO usuarios (usuario, salt, pin_hash, creado, estado) VALUES (?, ?, ?, ?, 'pendiente')",
-                        (usuario, salt, hash_pin(datos.pin, salt), obtener_hora()))
-    except sqlite3.IntegrityError:
+    r = pb("POST", f"/api/collections/{COLECCION}/records", json={
+        "usuario": usuario, "salt": salt.hex(), "pin_hash": hash_pin(datos.pin, salt).hex(),
+        "estado": "pendiente", "creado": obtener_hora()})
+    if r.status_code == 400:
         raise HTTPException(status_code=409, detail="Ese usuario ya existe")
+    if r.status_code not in (200, 201):
+        raise HTTPException(status_code=503, detail="No se pudo guardar la solicitud. Intentá de nuevo.")
+    _CACHE_ESTADO.pop(usuario, None)
 
     print(f"[{obtener_hora()}] [SOLICITUD] Nueva solicitud de acceso: {usuario}")
     return {"ok": True, "usuario": usuario}
@@ -984,10 +1068,11 @@ async def admin_login(datos: AdminLogin, request: Request):
 @app.get("/admin/usuarios")
 async def admin_usuarios(request: Request):
     autenticar_admin(request)
-    with closing(db()) as con:
-        filas = con.execute("SELECT usuario, estado, creado FROM usuarios ORDER BY creado").fetchall()
-    return {"usuarios": [{"usuario": f["usuario"], "estado": f["estado"], "creado": f["creado"],
-                          "fotos": len(archivos_de(f["usuario"]))} for f in filas]}
+    r = pb("GET", f"/api/collections/{COLECCION}/records", params={"perPage": 200, "sort": "creado"})
+    if r.status_code != 200:
+        raise HTTPException(status_code=503, detail="La base de datos de usuarios no está disponible.")
+    return {"usuarios": [{"usuario": f["usuario"], "estado": f["estado"], "creado": f.get("creado", ""),
+                          "fotos": len(archivos_de(f["usuario"]))} for f in r.json()["items"]]}
 
 
 @app.post("/admin/decidir")
@@ -997,10 +1082,13 @@ async def admin_decidir(datos: Decision, request: Request):
     if datos.accion not in ("aprobar", "rechazar"):
         raise HTTPException(status_code=400, detail="Acción inválida")
     nuevo = "aprobado" if datos.accion == "aprobar" else "rechazado"
-    with closing(db()) as con, con:
-        cur = con.execute("UPDATE usuarios SET estado = ? WHERE usuario = ?", (nuevo, usuario))
-    if cur.rowcount == 0:
+    rec = pb_usuario(usuario)
+    if not rec:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    r = pb("PATCH", f"/api/collections/{COLECCION}/records/{rec['id']}", json={"estado": nuevo})
+    if r.status_code != 200:
+        raise HTTPException(status_code=503, detail="No se pudo actualizar el usuario.")
+    _CACHE_ESTADO.pop(usuario, None)
     print(f"[{obtener_hora()}] [ADMIN] {usuario} -> {nuevo}")
     return {"ok": True, "usuario": usuario, "estado": nuevo}
 
@@ -1009,8 +1097,12 @@ async def admin_decidir(datos: Decision, request: Request):
 async def admin_eliminar(usuario: str, request: Request):
     autenticar_admin(request)
     usuario = normalizar_usuario(usuario)
-    with closing(db()) as con, con:
-        con.execute("DELETE FROM usuarios WHERE usuario = ?", (usuario,))
+    rec = pb_usuario(usuario)
+    if rec:
+        r = pb("DELETE", f"/api/collections/{COLECCION}/records/{rec['id']}")
+        if r.status_code not in (200, 204):
+            raise HTTPException(status_code=503, detail="No se pudo eliminar el usuario.")
+    _CACHE_ESTADO.pop(usuario, None)
     for t in [t for t, (u, _) in SESIONES.items() if u == usuario]:
         SESIONES.pop(t, None)
     for carpeta, lista in ((DIRECTORIO_CARAS, archivos_de(usuario)), (DIRECTORIO_PENDIENTES, pendientes_de(usuario))):
