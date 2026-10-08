@@ -18,6 +18,7 @@ from routers.usuarios import router as router_usuarios
 from routers.paginas import router as router_paginas
 from routers.admin import router as router_admin
 from routers.captura import router as router_captura
+from routers.aulas import router as router_aulas
 
 app = FastAPI()
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets"), check_dir=False),
@@ -72,6 +73,7 @@ app.router.routes.extend(router_paginas.routes)
 app.router.routes.extend(router_admin.routes)
 app.router.routes.extend(router_captura.routes)
 app.router.routes.extend(router_movimientos.routes)
+app.router.routes.extend(router_aulas.routes)
 
 
 if __name__ == "__main__":

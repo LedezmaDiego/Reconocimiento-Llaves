@@ -9,13 +9,35 @@ from fastapi.concurrency import run_in_threadpool
 from config import (BASE_DIR, CASILLERO_DEFECTO, CODIGO_VALIDO_S, UMBRAL,
                     VENTANA_RETIRO_S, MIN_BYTES_IMAGEN)
 from db import db, registrar_estado
-from estado import (ACCESO_CODIGO, ULTIMA_AUTORIZACION, ULTIMA_FOTO, ULTIMO_RESULTADO, modo_actual)
+from estado import (ACCESO_CODIGO, LOGIN_ROSTRO, ULTIMA_AUTORIZACION, ULTIMA_FOTO,
+                    ULTIMO_RESULTADO, modo_actual)
 from logs import log
 from reconocimiento import comparar_rostro
 from schemas import EventoCasillero
+from seguridad import crear_sesion
 
 router_reconocimiento = APIRouter()
 router_movimientos = APIRouter()
+
+def _resolver_login_rostro(res: dict) -> None:
+    """Resuelve las esperas de inicio de sesión por rostro con el resultado del frame."""
+    ahora = time.time()
+    for clave, espera in list(LOGIN_ROSTRO.items()):
+        if espera["expira"] < ahora:
+            LOGIN_ROSTRO.pop(clave, None)
+            continue
+        if espera["estado"] != "esperando":
+            continue
+        if res.get("autorizado") and res.get("persona", "").lower() == espera["usuario"]:
+            espera["estado"] = "autorizado"
+            espera["token"] = crear_sesion(espera["usuario"])
+            log("ACCESO", f"{espera['usuario']}: inicio de sesión por rostro")
+        elif res.get("autorizado"):
+            espera["aviso"] = f"Ese rostro no es {espera['usuario']}."
+        elif res.get("rostro"):
+            espera["aviso"] = "No reconocí ese rostro. Intentá de nuevo o usá tu PIN."
+        else:
+            espera["aviso"] = "No se detectó ningún rostro. Acercate a la cámara."
 
 @router_reconocimiento.post("/reconocimiento")
 async def reconocer_rostro(request: Request):
@@ -31,6 +53,8 @@ async def reconocer_rostro(request: Request):
 
     if modo_actual() == "registro":
         return {"status": "success", "modo": "registro", "autorizado": False, "mensaje": "Modo registro"}
+
+    hay_esperas = any(e["estado"] == "esperando" and e["expira"] > time.time() for e in LOGIN_ROSTRO.values())
 
     acc = ACCESO_CODIGO.get(casillero_id)
     if acc and time.time() - acc[1] <= CODIGO_VALIDO_S:
@@ -49,7 +73,16 @@ async def reconocer_rostro(request: Request):
         with open(ruta_temp, "wb") as f:
             f.write(cuerpo)
 
-        res = await run_in_threadpool(comparar_rostro, ruta_temp)
+        cache: dict = {}
+        async def resultado_rostro() -> dict:
+            if "res" not in cache:
+                cache["res"] = await run_in_threadpool(comparar_rostro, ruta_temp)
+            return cache["res"]
+
+        if hay_esperas:
+            _resolver_login_rostro(await resultado_rostro())
+
+        res = await resultado_rostro()
 
         if res.get("vacia"):
             ULTIMO_RESULTADO["texto"] = "No hay fotos de referencia"

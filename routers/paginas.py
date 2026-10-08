@@ -9,8 +9,8 @@ router = APIRouter()
 
 @router.get("/")
 async def raiz() -> RedirectResponse:
-    """Redirige la página principal a /registro."""
-    return RedirectResponse("/registro")
+    """Redirige la página principal al inicio de sesión."""
+    return RedirectResponse("/inicio-sesion")
 
 def pagina_react() -> Response:
     """Sirve el build de React o aviso si todavía no fue compilado."""
@@ -22,7 +22,17 @@ def pagina_react() -> Response:
 
 @router.get("/registro")
 async def pagina_usuario() -> Response:
-    """Sirve la vista de usuarios del frontend React."""
+    """Sirve la vista de solicitud de acceso del frontend React."""
+    return pagina_react()
+
+@router.get("/inicio-sesion")
+async def pagina_login() -> Response:
+    """Sirve la vista de inicio de sesión del frontend React."""
+    return pagina_react()
+
+@router.get("/panel")
+async def pagina_panel() -> Response:
+    """Sirve el panel del usuario (llaves, aulas y fotos) del frontend React."""
     return pagina_react()
 
 @router.get("/admin")

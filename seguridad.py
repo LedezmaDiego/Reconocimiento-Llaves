@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import re
+import secrets
 import time
 from fastapi import Request, HTTPException
 
@@ -50,6 +51,15 @@ def verificar_pin(usuario: str, pin: str) -> bool:
         return True
     registrar_fallo(usuario)
     return False
+
+def crear_sesion(usuario: str) -> str:
+    """Crea un token de sesión, purgando antes las sesiones vencidas."""
+    ahora = time.time()
+    for t in [t for t, (_, exp) in SESIONES.items() if exp < ahora]:
+        SESIONES.pop(t, None)
+    token = secrets.token_hex(16)
+    SESIONES[token] = (usuario, ahora + SESION_S)
+    return token
 
 def usuario_de_sesion(request: Request) -> str | None:
     """Recupera el usuario desde el token x-token y renueva la sesión."""

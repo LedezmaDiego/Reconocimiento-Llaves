@@ -41,6 +41,23 @@ BLOQUEO_S = 60
 CASILLERO_DEFECTO = "C01"
 RESERVADOS = {"admin", "administrador", "root"}
 
+# ---------------- Aulas y préstamos de llaves ----------------
+LOGIN_ROSTRO_TIMEOUT_S = 90   # validez de una solicitud de inicio de sesión por rostro
+AULA_NOMBRE_MAX = 60
+AULA_UBICACION_MAX = 80
+PRESTAMO_TEXTO_MAX = 80
+PRESTAMOS_HISTORIAL = 100     # eventos que devuelve el historial en /admin/aulas
+AULAS_EJEMPLO = (             # se cargan solo si la tabla de aulas está vacía
+    ("Aula 1", "Planta baja"),
+    ("Aula 2", "Planta alta"),
+    ("Laboratorio", "Planta alta"),
+)
+
+# ---------------- Captura en ráfaga ----------------
+FOTOS_LOTE_DEFECTO = 5     # fotos por pulsación en "Guardar 5 fotos"
+FOTOS_LOTE_MAX = 10        # tope por lote
+ESPERA_ENTRE_FOTOS_S = 0.6 # pausa entre fotos del lote (la placa envía cada ~0.3s)
+
 # ---------------- Constantes operativas ----------------
 PB_TIMEOUT_S = 5
 CACHE_ESTADO_S = 2

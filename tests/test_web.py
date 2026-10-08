@@ -25,13 +25,19 @@ class RutasWeb(unittest.TestCase):
         esperadas = {
             ("/reconocimiento", "POST"), ("/solicitar_acceso", "POST"),
             ("/login", "POST"), ("/acceso_codigo", "POST"),
+            ("/preparar_login", "POST"), ("/login_rostro", "POST"),
+            ("/login_rostro/{solicitud_id}", "GET"), ("/login_rostro/{solicitud_id}", "DELETE"),
             ("/admin/login", "POST"), ("/admin/usuarios", "GET"),
             ("/admin/decidir", "POST"), ("/admin/usuario/{usuario}", "DELETE"),
             ("/ultima_foto", "GET"), ("/estado", "GET"),
             ("/modo", "POST"), ("/guardar_foto", "POST"),
+            ("/guardar_lote", "POST"),
             ("/mis_fotos", "GET"), ("/foto/{archivo}", "GET"),
             ("/foto/{archivo}", "DELETE"), ("/devolucion", "POST"),
             ("/retiro", "POST"), ("/llaves", "GET"),
+            ("/aulas", "GET"), ("/aulas/pedir", "POST"), ("/aulas/devolver", "POST"),
+            ("/admin/aulas", "GET"), ("/admin/aulas", "POST"),
+            ("/admin/aulas/{aula_id}", "PATCH"), ("/admin/aulas/{aula_id}/liberar", "POST"),
         }
         self.assertTrue(esperadas <= rutas, esperadas - rutas)
 
@@ -70,7 +76,7 @@ class RutasWeb(unittest.TestCase):
         self.assertEqual(asyncio.run(self.pedir("/")), 307)
         pagina = next(r.endpoint for r in self.servidor.app.routes if r.path == "/registro")
         compilado = (Path(pagina.__globals__["FRONTEND_DIST"]) / "index.html").is_file()
-        for ruta in ("/registro", "/admin"):
+        for ruta in ("/registro", "/inicio-sesion", "/panel", "/admin"):
             self.assertEqual(asyncio.run(self.pedir(ruta)), 200 if compilado else 503)
 
     def test_sin_compilar_la_api_sigue_disponible(self):

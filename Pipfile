@@ -83,6 +83,7 @@ name = "pypi"
 "wrapt" = "==2.2.2"
 
 [dev-packages]
+httpx = "*"
 
 [requires]
 python_version = "3.12"

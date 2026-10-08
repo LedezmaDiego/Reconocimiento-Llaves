@@ -8,9 +8,10 @@ export default defineConfig({
   server: {
     proxy: Object.fromEntries([
       '/solicitar_acceso', '/login', '/acceso_codigo', '/estado', '/modo',
-      '/ultima_foto', '/guardar_foto', '/mis_fotos', '/foto', '/reconocimiento',
-      '/retiro', '/devolucion', '/llaves',
-      '^/admin/(login|usuarios|decidir|usuario)',
+      '/preparar_login', '/login_rostro',
+      '/ultima_foto', '/guardar_foto', '/guardar_lote', '/mis_fotos', '/foto', '/reconocimiento',
+      '/retiro', '/devolucion', '/llaves', '/aulas',
+      '^/admin/(login|usuarios|decidir|usuario|aulas)',
     ].map((path) => [path, backend])),
   },
 })

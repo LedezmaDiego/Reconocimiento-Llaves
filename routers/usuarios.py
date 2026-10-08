@@ -4,12 +4,14 @@ import secrets
 import time
 from fastapi import APIRouter, HTTPException
 
-from config import COLECCION, MAX_PENDIENTES, SESION_S, CODIGO_VALIDO_S
-from estado import _CACHE_ESTADO, SESIONES, ACCESO_CODIGO
+from config import COLECCION, MAX_PENDIENTES, LOGIN_ROSTRO_TIMEOUT_S, CODIGO_VALIDO_S
+from estado import _CACHE_ESTADO, ACCESO_CODIGO, LOGIN_ROSTRO
 from logs import obtener_hora, log
+from fotos import archivos_de
 from pocketbase import pb, pb_usuario, estado_de
-from schemas import SolicitudAcceso, LoginDatos, AccesoCodigo
-from seguridad import normalizar_usuario, usuario_valido, hash_pin, verificar_pin
+from schemas import SolicitudAcceso, LoginDatos, AccesoCodigo, UsuarioSimple
+from seguridad import (normalizar_usuario, usuario_valido, hash_pin, verificar_pin,
+                        crear_sesion)
 
 router = APIRouter()
 
@@ -48,12 +50,60 @@ async def login(datos: LoginDatos):
     usuario = normalizar_usuario(datos.usuario)
     if not verificar_pin(usuario, datos.pin):
         raise HTTPException(status_code=401, detail="Usuario o código incorrecto")
+    return {"token": crear_sesion(usuario), "usuario": usuario, "estado": estado_de(usuario)}
+
+@router.post("/preparar_login")
+async def preparar_login(datos: UsuarioSimple):
+    """Paso 1 del inicio de sesión: indica si el usuario existe y qué métodos puede usar."""
+    usuario = normalizar_usuario(datos.usuario)
+    if not usuario_valido(usuario):
+        raise HTTPException(status_code=400, detail="Usuario inválido: solo letras, de 3 a 20 caracteres")
+    rec = pb_usuario(usuario)
+    if not rec:
+        raise HTTPException(status_code=404, detail="Ese usuario no existe. Solicitá acceso primero.")
+    return {"usuario": usuario, "estado": rec["estado"], "puede_rostro": bool(archivos_de(usuario))}
+
+@router.post("/login_rostro")
+async def login_rostro(datos: UsuarioSimple):
+    """Paso 2 alternativo: abre una espera de inicio de sesión por reconocimiento facial."""
+    usuario = normalizar_usuario(datos.usuario)
+    if not usuario_valido(usuario):
+        raise HTTPException(status_code=400, detail="Usuario inválido: solo letras, de 3 a 20 caracteres")
+    if not pb_usuario(usuario):
+        raise HTTPException(status_code=404, detail="Ese usuario no existe. Solicitá acceso primero.")
+    if not archivos_de(usuario):
+        raise HTTPException(status_code=409, detail="No tenés fotos registradas. Entrá con tu PIN.")
+
     ahora = time.time()
-    for t in [t for t, (_, exp) in SESIONES.items() if exp < ahora]:
-        SESIONES.pop(t, None)
-    token = secrets.token_hex(16)
-    SESIONES[token] = (usuario, ahora + SESION_S)
-    return {"token": token, "usuario": usuario, "estado": estado_de(usuario)}
+    for clave, pendiente in [ (k, v) for k, v in LOGIN_ROSTRO.items() if v["expira"] < ahora ]:
+        LOGIN_ROSTRO.pop(clave, None)
+    if sum(1 for v in LOGIN_ROSTRO.values() if v["usuario"] == usuario and v["estado"] == "esperando") >= 2:
+        raise HTTPException(status_code=429, detail="Ya hay una espera de reconocimiento en curso.")
+
+    solicitud_id = secrets.token_hex(8)
+    LOGIN_ROSTRO[solicitud_id] = {"usuario": usuario, "expira": ahora + LOGIN_ROSTRO_TIMEOUT_S,
+                                  "estado": "esperando", "token": None, "aviso": None}
+    log("ACCESO", f"{usuario}: esperando reconocimiento facial")
+    return {"ok": True, "solicitud_id": solicitud_id, "espera_s": LOGIN_ROSTRO_TIMEOUT_S}
+
+@router.get("/login_rostro/{solicitud_id}")
+async def estado_login_rostro(solicitud_id: str):
+    """Consulta el estado de una espera de reconocimiento facial."""
+    pendiente = LOGIN_ROSTRO.get(solicitud_id)
+    if not pendiente:
+        raise HTTPException(status_code=404, detail="La espera no existe o venció.")
+    if pendiente["expira"] < time.time() and pendiente["estado"] == "esperando":
+        pendiente["estado"] = "expirado"
+    if pendiente["estado"] == "autorizado":
+        LOGIN_ROSTRO.pop(solicitud_id, None)   # El token se entrega una única vez.
+        return {"estado": "autorizado", "token": pendiente["token"], "usuario": pendiente["usuario"]}
+    return {"estado": pendiente["estado"], "usuario": pendiente["usuario"], "aviso": pendiente["aviso"]}
+
+@router.delete("/login_rostro/{solicitud_id}")
+async def cancelar_login_rostro(solicitud_id: str):
+    """Cancela una espera de reconocimiento facial."""
+    LOGIN_ROSTRO.pop(solicitud_id, None)
+    return {"ok": True}
 
 @router.post("/acceso_codigo")
 async def acceso_codigo(datos: AccesoCodigo):

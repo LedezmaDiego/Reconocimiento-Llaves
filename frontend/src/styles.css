@@ -58,6 +58,8 @@ button.chico { padding: 6px 12px; font-size: .9rem; }
 .b-pendiente { background: #3d2e0e; color: #f5a524; }
 .b-aprobado { background: #12301f; color: #57d08b; }
 .b-rechazado { background: #3a1618; color: #ff8589; }
+.b-ocupada { background: #3d2e0e; color: #f5a524; }
+.b-gris { background: #2a2f3a; color: #a6aebe; }
 .barra { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 20px; }
 .fila {
   display: flex;
@@ -96,6 +98,32 @@ button.chico { padding: 6px 12px; font-size: .9rem; }
 }
 .item button { margin-top: 8px; }
 .pend { color: #f5a524; }
+
+/* ---- Aulas y préstamos ---- */
+h3 { font-size: .95rem; margin: 12px 0 8px; }
+.crecer { flex: 1; min-width: 160px; }
+.crecer input { margin-top: 0; }
+.lista-aulas { display: flex; flex-direction: column; gap: 8px; }
+.aula {
+  background: #0f1115;
+  border: 1px solid #303540;
+  border-radius: 10px;
+  padding: 12px;
+}
+.aula-ocupada { opacity: .62; }
+.fila-aula { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+.modal-fondo {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, .6);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  z-index: 20;
+  overflow-y: auto;
+}
+.modal { max-width: 420px; width: 100%; margin: 0; }
 
 @media (max-width: 430px) {
   .card { padding: 16px; }

@@ -21,6 +21,8 @@ INTENTOS: dict[str, list] = {}          # usuarios y "admin:<ip>"
 
 AVISOS: dict[str, list] = {}
 
+LOGIN_ROSTRO: dict[str, dict] = {}   # solicitudes de inicio de sesión por rostro (las atiende /reconocimiento)
+
 BASE_EMBEDDINGS: dict[str, dict] = {}
 
 LOCK_BASE = threading.Lock()

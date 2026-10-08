@@ -1,9 +1,11 @@
+import asyncio
 import os
 import time
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import Response, JSONResponse, FileResponse
 
-from config import REGISTRO_TIMEOUT_S, FOTO_RECIENTE_S
+from config import (REGISTRO_TIMEOUT_S, FOTO_RECIENTE_S, FOTOS_LOTE_DEFECTO,
+                    FOTOS_LOTE_MAX, ESPERA_ENTRE_FOTOS_S)
 from estado import (ULTIMA_FOTO, ULTIMO_RESULTADO, MODO, AVISOS, BASE_EMBEDDINGS, LOCK_BASE, modo_actual)
 from fotos import guardar_pendiente, archivos_de, pendientes_de, ruta_foto_de
 from logs import log
@@ -55,6 +57,45 @@ async def guardar_foto(request: Request):
             "ok": False, "mensaje": "No hay una foto reciente. ¿La placa está enviando? Inicia la captura."})
     res = guardar_pendiente(usuario, ULTIMA_FOTO["bytes"])
     return JSONResponse(status_code=200 if res["ok"] else 422, content=res)
+
+async def _esperar_frame_nuevo(ts_anterior: float, timeout: float) -> bool:
+    """Espera a que la placa envíe un frame más reciente que ts_anterior."""
+    limite = time.time() + timeout
+    while time.time() < limite:
+        if ULTIMA_FOTO["ts"] > ts_anterior and ULTIMA_FOTO["bytes"] is not None:
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+@router.post("/guardar_lote")
+async def guardar_lote(request: Request, cantidad: int = FOTOS_LOTE_DEFECTO):
+    """Guarda varias fotos distintas con una sola pulsación (captura en ráfaga)."""
+    usuario = autenticar(request)
+    cantidad = max(1, min(cantidad, FOTOS_LOTE_MAX))
+
+    guardadas, errores = [], []
+    ts_previo = float("-inf")
+    for _ in range(cantidad):
+        if not await _esperar_frame_nuevo(ts_previo, 3.0):
+            # La placa dejó de enviar: no seguir esperando en vano.
+            errores.append("La placa no envió una foto nueva a tiempo.")
+            break
+        ts_previo = ULTIMA_FOTO["ts"]
+        res = guardar_pendiente(usuario, ULTIMA_FOTO["bytes"])
+        if res["ok"]:
+            guardadas.append(res["archivo"])
+        else:
+            errores.append(res["mensaje"])
+            break
+        if len(guardadas) < cantidad:
+            await asyncio.sleep(ESPERA_ENTRE_FOTOS_S)
+
+    if not guardadas and errores:
+        return JSONResponse(status_code=422, content={"ok": False, "mensaje": errores[0]})
+    resumen = f"{len(guardadas)} foto(s) guardada(s)"
+    if errores:
+        resumen += f" · {errores[0]}"
+    return {"ok": True, "guardadas": guardadas, "mensaje": resumen, "errores": errores}
 
 @router.get("/mis_fotos")
 async def mis_fotos(request: Request):

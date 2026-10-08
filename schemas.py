@@ -25,4 +25,25 @@ class Decision(BaseModel):
 class EventoCasillero(BaseModel):
     casillero_id: str
 
+class UsuarioSimple(BaseModel):
+    usuario: str
+
+class PedidoLlave(BaseModel):
+    aula_id: int
+    profesor: str = ""
+    actividad: str
+    hasta: str    # hora local en formato "HH:MM"
+
+class DevolucionLlave(BaseModel):
+    aula_id: int
+
+class AulaNueva(BaseModel):
+    nombre: str
+    ubicacion: str = ""
+
+class AulaEdicion(BaseModel):
+    nombre: str | None = None
+    ubicacion: str | None = None
+    activa: bool | None = None
+
 
