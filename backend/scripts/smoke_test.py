@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-RAIZ = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(RAIZ))
+RAIZ = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(RAIZ / "backend"))
 
 import db  # noqa: E402
 import main as app_module  # noqa: E402

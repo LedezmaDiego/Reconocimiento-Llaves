@@ -4,15 +4,16 @@ import { Registro } from './pages/Registro.jsx'
 import { Login } from './pages/Login.jsx'
 import { Panel } from './pages/Panel.jsx'
 import { Admin } from './pages/Admin.jsx'
+import { guardarSesion, leerSesion, borrarSesion } from './sesion.js'
 import './styles.css'
 
 const RUTAS = ['/registro', '/inicio-sesion', '/panel', '/admin']
 
-// Router mínimo por URL, sin dependencias. La sesión vive en memoria:
-// el servidor guarda los tokens y acá solo se mantienen mientras dura la pestaña.
+// Router mínimo por URL, sin dependencias. La sesión se guarda en localStorage
+// para sobrevivir recargas; el servidor valida el token en cada petición.
 function App() {
   const [ruta, setRuta] = useState(window.location.pathname)
-  const [sesion, setSesion] = useState(null)
+  const [sesion, setSesion] = useState(leerSesion)
 
   useEffect(() => {
     const alVolver = () => setRuta(window.location.pathname)
@@ -32,11 +33,13 @@ function App() {
   }, [ruta, sesion])
 
   function entrar(datos) {
+    guardarSesion(datos)
     setSesion(datos)
     ir('/panel')
   }
 
   function salir() {
+    borrarSesion()
     setSesion(null)
     ir('/inicio-sesion')
   }

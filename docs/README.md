@@ -82,23 +82,27 @@ Desde la red (ESP32-CAM, dispenser, otros equipos): usá la IP del servidor, por
 ```
 ├── iniciar.sh             # Script de arranque
 ├── .env.example           # Configuración de ejemplo
-├── main.py                # Servidor FastAPI
-├── config.py              # Constantes y variables
-├── db.py                  # SQLite (casilleros, aulas, préstamos)
-├── estado.py              # Estado en memoria
-├── pocketbase.py          # Cliente PocketBase
-├── reconocimiento.py      # DeepFace (embeddings)
-├── fotos.py               # Gestión de fotos + worker
-├── seguridad.py           # PIN, sesiones, tokens
-├── schemas.py             # Modelos Pydantic
-├── logs.py                # Logging
-├── llavero_esp32cam.ino   # Firmware cámara (Arduino IDE)
-├── dispensador.ino        # Firmware dispensador (Arduino IDE)
+├── requirements.txt       # Dependencias Python (UTF-16 LE con BOM)
+├── llaves.db              # SQLite (gitignored en ejecución)
+├── backend/               # Código Python (FastAPI)
+│   ├── main.py            # Servidor FastAPI (punto de entrada)
+│   ├── config.py          # Constantes y variables
+│   ├── db.py              # SQLite (casilleros, aulas, préstamos)
+│   ├── estado.py          # Estado en memoria
+│   ├── pocketbase.py      # Cliente PocketBase
+│   ├── reconocimiento.py  # DeepFace (embeddings)
+│   ├── fotos.py           # Gestión de fotos + worker
+│   ├── seguridad.py       # PIN, sesiones, tokens
+│   ├── schemas.py         # Modelos Pydantic
+│   ├── logs.py            # Logging
+│   ├── routers/           # Endpoints por dominio
+│   └── scripts/
+│       └── smoke_test.py  # Comprobación rápida
+├── firmware/              # Sketches Arduino IDE
+│   ├── llavero_esp32cam.ino   # Firmware cámara ESP32-CAM
+│   └── dispensador.ino        # Firmware dispensador ESP32
 ├── frontend/              # React + Vite
-├── routers/               # Endpoints por dominio
-├── scripts/smoke_test.py  # Comprobación rápida
-├── requirements.txt
-└── README.md
+└── docs/                  # Documentación
 ```
 
 ## Almacenamiento
@@ -138,10 +142,10 @@ const char* DISPENSADOR_ID = "D01";
 
 ```bash
 # Sintaxis (sin servicios)
-source venv/bin/activate && python -m py_compile main.py
+source venv/bin/activate && python -m py_compile backend/main.py
 
 # Smoke test (no necesita PocketBase activo)
-python scripts/smoke_test.py
+python backend/scripts/smoke_test.py
 
 # Tests del frontend
 npm test --prefix frontend

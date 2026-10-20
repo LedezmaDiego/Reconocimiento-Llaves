@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
+import { guardarSesionAdmin, leerSesionAdmin, borrarSesionAdmin } from '../sesion.js'
 
 function FilaUsuario({ usuario, decidir, eliminar }) {
   return (
@@ -208,11 +209,26 @@ function PestanaUsuarios({ token }) {
 
 export function Admin() {
   const [clave, setClave] = useState('')
-  const [token, setToken] = useState(null)
+  const [token, setToken] = useState(leerSesionAdmin)
   const [pestana, setPestana] = useState('usuarios')
   const [aviso, setAviso] = useState(null)
 
+  // Si la sesión restaurada ya venció, la descartamos y pedimos login de nuevo.
+  useEffect(() => {
+    if (!token) return
+    let activo = true
+    api('/admin/usuarios', { adminToken: token })
+      .catch((error) => {
+        if (activo && (error.status === 401 || error.status === 403)) {
+          borrarSesionAdmin()
+          setToken(null)
+        }
+      })
+    return () => { activo = false }
+  }, [])
+
   function cerrar(expirada = false) {
+    borrarSesionAdmin()
     setToken(null)
     setPestana('usuarios')
     document.title = 'Administración · Llavero ETEC'
@@ -223,6 +239,7 @@ export function Admin() {
     evento.preventDefault()
     try {
       const datos = await api('/admin/login', { method: 'POST', body: { clave } })
+      guardarSesionAdmin(datos.token)
       setToken(datos.token)
       setClave('')
       setAviso(null)

@@ -1,6 +1,6 @@
 import os
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIRECTORIO_CARAS = os.path.join(BASE_DIR, "personas_autorizadas")
 DIRECTORIO_PENDIENTES = os.path.join(BASE_DIR, "fotos_pendientes")
 DB_PATH = os.path.join(BASE_DIR, "llaves.db")

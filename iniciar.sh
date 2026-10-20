@@ -148,7 +148,7 @@ arrancar() {
   # shellcheck disable=SC1091
   source "$VENV/bin/activate"
   ADMIN_CLAVE="$ADMIN_CLAVE" PB_EMAIL="$PB_EMAIL" PB_PASSWORD="$PB_PASSWORD" PB_URL="$PB_URL" \
-    setsid nohup python main.py > server.log 2>&1 < /dev/null &
+    setsid nohup python backend/main.py > server.log 2>&1 < /dev/null &
   # DeepFace/TensorFlow tardan en importar: se espera hasta 180s.
   if esperar_puerto "$PUERTO_API" 180 "FastAPI"; then
     ok "FastAPI corriendo → http://localhost:$PUERTO_API"

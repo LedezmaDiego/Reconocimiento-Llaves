@@ -26,7 +26,7 @@
     {
       "label": "Smoke test",
       "type": "shell",
-      "command": "source venv/bin/activate && python scripts/smoke_test.py",
+      "command": "source venv/bin/activate && python backend/scripts/smoke_test.py",
       "options": { "cwd": "${workspaceFolder}" },
       "problemMatcher": []
     }

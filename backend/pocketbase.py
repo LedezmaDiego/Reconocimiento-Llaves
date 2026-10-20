@@ -10,7 +10,7 @@ from logs import log
 
 def pb_login() -> None:
     """Autentica con PocketBase y renueva el token de superusuario."""
-    r = requests.post(f"{PB_URL}/api/admins/auth-with-password",
+    r = requests.post(f"{PB_URL}/api/collections/_superusers/auth-with-password",
                       json={"identity": PB_EMAIL, "password": PB_PASSWORD}, timeout=PB_TIMEOUT_S)
     r.raise_for_status()
     _PB["token"] = r.json()["token"]

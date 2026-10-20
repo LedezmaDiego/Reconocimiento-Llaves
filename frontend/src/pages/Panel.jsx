@@ -9,35 +9,6 @@ function notificar(titulo, texto) {
   } catch { /* La notificación del navegador es opcional. */ }
 }
 
-function Foto({ archivo, estado, token, onDelete }) {
-  const [url, setUrl] = useState(null)
-  useEffect(() => {
-    let activo = true
-    let imagen
-    api(`/foto/${encodeURIComponent(archivo)}`, { token, response: 'blob' })
-      .then((blob) => {
-        imagen = URL.createObjectURL(blob)
-        if (activo) setUrl(imagen)
-        else URL.revokeObjectURL(imagen)
-      })
-      .catch(() => {})
-    return () => {
-      activo = false
-      if (imagen) URL.revokeObjectURL(imagen)
-    }
-  }, [archivo, token])
-
-  return (
-    <div className="item">
-      {url ? <img src={url} alt={`Foto ${archivo}`} /> : <div className="foto-vacia">Cargando foto…</div>}
-      <div className={estado === 'pendiente' ? 'pend' : ''}>
-        {archivo}{estado === 'pendiente' ? ' (verificando…)' : ''}
-      </div>
-      <button className="rojo chico" onClick={() => onDelete(archivo)}>Borrar</button>
-    </div>
-  )
-}
-
 const ETIQUETA_ESTADO = {
   disponible: { texto: 'Disponible', clase: 'b-aprobado' },
   ocupada: { texto: 'Ocupada', clase: 'b-ocupada' },
@@ -103,23 +74,14 @@ function FormPedido({ aula, usuario, token, onCerrar, onGuardado }) {
 export function Panel({ sesion, onSalir }) {
   const [estado, setEstado] = useState(null)
   const [aviso, setAviso] = useState(null)
-  const [mensajeFoto, setMensajeFoto] = useState('')
-  const [capturando, setCapturando] = useState(false)
-  const [preview, setPreview] = useState(null)
-  const [guardandoLote, setGuardandoLote] = useState(false)
-  const previewUrl = useRef(null)
-  const estadoAnterior = useRef(null)
-  const [fotos, setFotos] = useState([])
-  const [refrescarFotos, setRefrescarFotos] = useState(0)
   const [aulas, setAulas] = useState([])
   const [mensajeAulas, setMensajeAulas] = useState('')
   const [pedido, setPedido] = useState(null)
+  const estadoAnterior = useRef(null)
 
   // Una sola salida que apaga también el modo registro de la placa.
   async function salir() {
-    if (capturando) {
-      try { await api('/modo?m=reconocimiento', { method: 'POST', token: sesion.token }) } catch { /* El modo caduca en el servidor. */ }
-    }
+    try { await api('/modo?m=reconocimiento', { method: 'POST', token: sesion.token }) } catch { /* El modo caduca en el servidor. */ }
     onSalir()
   }
 
@@ -132,8 +94,8 @@ export function Panel({ sesion, onSalir }) {
         if (!activo) return
         if (!datos.estado_usuario) { onSalir(); return }
         if (estadoAnterior.current === 'pendiente' && datos.estado_usuario === 'aprobado') {
-          setAviso({ texto: '¡Solicitud aprobada! Ya podés registrar tu cara.', tipo: 'ok' })
-          notificar('¡Solicitud aprobada!', 'Ya podés registrar tu cara.')
+          setAviso({ texto: '¡Solicitud aprobada! Ya podés usar el sistema.', tipo: 'ok' })
+          notificar('¡Solicitud aprobada!', 'Ya podés usar el sistema.')
         }
         estadoAnterior.current = datos.estado_usuario
         setEstado(datos)
@@ -145,26 +107,6 @@ export function Panel({ sesion, onSalir }) {
     consultar()
     return () => { activo = false; clearTimeout(timer) }
   }, [sesion.token])
-
-  useEffect(() => {
-    if (estado?.estado_usuario !== 'aprobado') return
-    let activo = true
-    let timer
-    async function consultar() {
-      try {
-        const datos = await api('/mis_fotos', { token: sesion.token })
-        if (!activo) return
-        setFotos(datos.fotos)
-        if (datos.avisos?.length) setMensajeFoto(`Foto rechazada: ${datos.avisos.join(' | ')}`)
-        timer = setTimeout(consultar, datos.fotos.some((f) => f.estado === 'pendiente') ? 2000 : 6000)
-      } catch (error) {
-        if (activo && error.status === 401) salir()
-        else if (activo) timer = setTimeout(consultar, 6000)
-      }
-    }
-    consultar()
-    return () => { activo = false; clearTimeout(timer) }
-  }, [sesion.token, estado?.estado_usuario, refrescarFotos])
 
   useEffect(() => {
     if (estado?.estado_usuario !== 'aprobado') return
@@ -184,69 +126,6 @@ export function Panel({ sesion, onSalir }) {
     consultar()
     return () => { activo = false; clearTimeout(timer) }
   }, [sesion.token, estado?.estado_usuario])
-
-  useEffect(() => {
-    if (!capturando) return
-    let activo = true
-    let timer
-    const controller = new AbortController()
-    async function siguienteFoto() {
-      try {
-        const foto = await api(`/ultima_foto?t=${Date.now()}`, {
-          token: sesion.token, response: 'blob', signal: controller.signal,
-        })
-        if (activo) {
-          const url = URL.createObjectURL(foto)
-          if (previewUrl.current) URL.revokeObjectURL(previewUrl.current)
-          previewUrl.current = url
-          setPreview(url)
-        }
-      } catch (error) {
-        if (activo && error.status === 401) { salir(); return }
-      }
-      if (activo) timer = setTimeout(siguienteFoto, 400)
-    }
-    siguienteFoto()
-    const renovar = setInterval(() => api('/modo?m=registro', { method: 'POST', token: sesion.token }).catch(() => {}), 30000)
-    return () => { activo = false; controller.abort(); clearTimeout(timer); clearInterval(renovar) }
-  }, [capturando, sesion.token])
-
-  useEffect(() => () => { if (previewUrl.current) URL.revokeObjectURL(previewUrl.current) }, [])
-
-  async function cambiarCaptura() {
-    try {
-      await api(`/modo?m=${capturando ? 'reconocimiento' : 'registro'}`, { method: 'POST', token: sesion.token })
-      setCapturando(!capturando)
-    } catch (error) { setAviso({ texto: error.message, tipo: 'err' }) }
-  }
-
-  async function guardar() {
-    setMensajeFoto('Guardando…')
-    try {
-      const datos = await api('/guardar_foto', { method: 'POST', token: sesion.token })
-      setMensajeFoto(`Guardada: ${datos.archivo} (verificando la cara en segundo plano…)`)
-      setRefrescarFotos((valor) => valor + 1)
-    } catch (error) { setMensajeFoto(`Error: ${error.message}`) }
-  }
-
-  async function guardarLote() {
-    setGuardandoLote(true)
-    setMensajeFoto('Capturando 5 fotos… no te muevas mucho.')
-    try {
-      const datos = await api('/guardar_lote?cantidad=5', { method: 'POST', token: sesion.token })
-      setMensajeFoto(`${datos.mensaje}: ${datos.guardadas.join(', ')} (verificando en segundo plano…)`)
-      setRefrescarFotos((valor) => valor + 1)
-    } catch (error) { setMensajeFoto(`Error: ${error.message}`) }
-    finally { setGuardandoLote(false) }
-  }
-
-  async function borrar(archivo) {
-    if (!window.confirm(`¿Borrar ${archivo}?`)) return
-    try {
-      await api(`/foto/${encodeURIComponent(archivo)}`, { method: 'DELETE', token: sesion.token })
-      setRefrescarFotos((valor) => valor + 1)
-    } catch (error) { setMensajeFoto(`Error: ${error.message}`) }
-  }
 
   async function devolver(aula) {
     if (!window.confirm(`¿Devolver la llave de ${aula.nombre}?`)) return
@@ -294,20 +173,6 @@ export function Panel({ sesion, onSalir }) {
           </div>
           <p className="mut separado">Hoy: {hoy}. Las llaves sin devolver quedan marcadas en gris hasta que alguien las devuelva.</p>
         </section>
-
-        <section className="card">
-          <h2>Registrar mi cara</h2>
-          <div className="mut">Modo: <strong>{estado.modo === 'registro' ? 'REGISTRO' : 'RECONOCIMIENTO'}</strong> · {estado.edad_foto == null ? 'la placa todavía no envió fotos' : `última foto hace ${estado.edad_foto} s`}</div>
-          <div className="mut">Último resultado: <strong>{estado.ultimo || '—'}</strong></div>
-          <button onClick={cambiarCaptura} className="separado">{capturando ? 'Terminar captura' : 'Iniciar captura'}</button>
-          {preview ? <img className="live" src={preview} alt="Vista de la cámara" /> : <div className="live placeholder">Esperando una foto de la placa…</div>}
-          <p className="mut">Mirá de frente, con buena luz, y guardá varias fotos cambiando un poco el ángulo.</p>
-          <button className="ok" onClick={guardarLote} disabled={guardandoLote}>{guardandoLote ? 'Capturando…' : 'Guardar 5 fotos (ráfaga)'}</button>
-          <button className="ghost separado" onClick={guardar} disabled={guardandoLote}>Guardar 1 foto</button>
-          <p role="status" className="mut">{mensajeFoto}</p>
-        </section>
-
-        <section className="card"><h2>Mis fotos</h2><div className="grid">{fotos.length ? fotos.map((foto) => <Foto key={foto.archivo} {...foto} token={sesion.token} onDelete={borrar} />) : <p className="mut">Todavía no tenés fotos.</p>}</div></section>
       </>}
 
       {pedido && <FormPedido aula={pedido} usuario={sesion.usuario} token={sesion.token}
