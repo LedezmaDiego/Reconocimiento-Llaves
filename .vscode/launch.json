@@ -1,0 +1,26 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "FastAPI: Servidor (ESP32-CAM + Web)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "main:app",
+        "--host", "0.0.0.0",
+        "--port", "8000",
+        "--reload"
+      ],
+      "env": {
+        "ADMIN_CLAVE": "admin123",
+        "PB_EMAIL": "admin@llavero.local",
+        "PB_PASSWORD": "LlaveroAdmin2026!",
+        "PB_URL": "http://127.0.0.1:8090"
+      },
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

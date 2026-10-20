@@ -13,10 +13,6 @@ ULTIMA_AUTORIZACION: dict[str, tuple[str, float]] = {}
 
 ACCESO_CODIGO: dict[str, tuple[str, float]] = {}
 
-SESIONES: dict[str, tuple[str, float]] = {}
-
-SESIONES_ADMIN: dict[str, float] = {}
-
 INTENTOS: dict[str, list] = {}          # usuarios y "admin:<ip>"
 
 AVISOS: dict[str, list] = {}
@@ -24,6 +20,24 @@ AVISOS: dict[str, list] = {}
 LOGIN_ROSTRO: dict[str, dict] = {}   # solicitudes de inicio de sesión por rostro (las atiende /reconocimiento)
 
 BASE_EMBEDDINGS: dict[str, dict] = {}
+
+# ---------------- Dispensador de llaves ----------------
+# Solicitud de llave activa: el ESP32-CAM / frontend la crea y el ESP32 la consume.
+SOLICITUD_LLAVE: dict = {
+    "activa": False,
+    "aula_id": None,
+    "aula_nombre": "",
+    "persona": "",
+    "rfid": "",
+    "requiere_pin": False,
+    "intentos_rostro": 0,
+    "creada": 0.0,
+}
+
+LOCK_SOLICITUD = threading.Lock()
+
+# Último evento reportado por el dispensador (para el panel y logs).
+ULTIMO_EVENTO_DISPENSADOR: dict = {"evento": "ninguno", "detalle": "", "ts": 0.0}
 
 LOCK_BASE = threading.Lock()
 

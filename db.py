@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import closing
 
 from config import DB_PATH, AULAS_EJEMPLO, PRESTAMOS_HISTORIAL
-from logs import obtener_hora
+from logs import log, obtener_hora
 
 def db() -> sqlite3.Connection:
     """Abre una conexión SQLite y configura el cursor tipo diccionario."""
@@ -22,12 +22,17 @@ def init_db() -> None:
         con.execute("""CREATE TABLE IF NOT EXISTS aulas (
             id INTEGER PRIMARY KEY AUTOINCREMENT, nombre TEXT NOT NULL,
             ubicacion TEXT NOT NULL DEFAULT '', activa INTEGER NOT NULL DEFAULT 1,
-            creada TEXT NOT NULL)""")
+            rfid TEXT NOT NULL DEFAULT '', creada TEXT NOT NULL)""")
         con.execute("""CREATE TABLE IF NOT EXISTS prestamos (
             id INTEGER PRIMARY KEY AUTOINCREMENT, aula_id INTEGER NOT NULL,
             profesor TEXT NOT NULL, actividad TEXT NOT NULL, desde TEXT NOT NULL,
             hasta TEXT NOT NULL, devuelto TEXT, registrado_por TEXT NOT NULL)""")
         con.execute("CREATE INDEX IF NOT EXISTS idx_prestamos_aula ON prestamos (aula_id, devuelto)")
+        # Migración suave: agregar columna rfid a aulas si la tabla ya existía sin ella.
+        columnas = {r[1] for r in con.execute("PRAGMA table_info(aulas)").fetchall()}
+        if "rfid" not in columnas:
+            con.execute("ALTER TABLE aulas ADD COLUMN rfid TEXT NOT NULL DEFAULT ''")
+            log("DB", "Columna 'rfid' agregada a aulas")
     cargar_aulas_ejemplo()
 
 def cargar_aulas_ejemplo() -> None:
@@ -43,7 +48,7 @@ def aulas() -> list[dict]:
     """Lista las aulas con su préstamo activo (sin devolver), si lo tienen."""
     with closing(db()) as con:
         filas = con.execute("""
-            SELECT a.id, a.nombre, a.ubicacion, a.activa,
+            SELECT a.id, a.nombre, a.ubicacion, a.activa, a.rfid,
                    p.id AS prestamo_id, p.profesor, p.actividad, p.desde, p.hasta, p.registrado_por
             FROM aulas a
             LEFT JOIN prestamos p ON p.aula_id = a.id AND p.devuelto IS NULL
@@ -56,6 +61,16 @@ def aula_por_id(aula_id: int) -> dict | None:
         fila = con.execute("SELECT * FROM aulas WHERE id = ?", (aula_id,)).fetchone()
     return dict(fila) if fila else None
 
+def aula_por_rfid(rfid: str) -> dict | None:
+    """Devuelve el aula asociada a un tag RFID, o None."""
+    with closing(db()) as con:
+        fila = con.execute("SELECT * FROM aulas WHERE rfid = ? AND activa = 1", (rfid,)).fetchone()
+    return dict(fila) if fila else None
+
+def asignar_rfid(aula_id: int, rfid: str) -> dict | None:
+    """Asigna (o limpia) el tag RFID de un aula."""
+    return actualizar_aula(aula_id, {"rfid": (rfid or "").strip()})
+
 def crear_aula(nombre: str, ubicacion: str) -> dict:
     """Da de alta un aula nueva."""
     with closing(db()) as con, con:
@@ -66,7 +81,7 @@ def crear_aula(nombre: str, ubicacion: str) -> dict:
 
 def actualizar_aula(aula_id: int, campos: dict) -> dict | None:
     """Actualiza nombre, ubicación o estado activo de un aula."""
-    permitidos = {k: v for k, v in campos.items() if k in ("nombre", "ubicacion", "activa") and v is not None}
+    permitidos = {k: v for k, v in campos.items() if k in ("nombre", "ubicacion", "activa", "rfid") and v is not None}
     if not permitidos:
         return aula_por_id(aula_id)
     asignaciones = ", ".join(f"{k} = ?" for k in permitidos)

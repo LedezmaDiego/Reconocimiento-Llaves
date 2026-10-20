@@ -8,6 +8,7 @@ from db import (aulas, aula_por_id, crear_aula, actualizar_aula, registrar_prest
                 prestamo_activo, devolver_prestamo, historial_prestamos)
 from logs import log, obtener_hora
 from schemas import PedidoLlave, DevolucionLlave, AulaNueva, AulaEdicion
+from db import aula_por_rfid, asignar_rfid
 from seguridad import autenticar, autenticar_admin
 
 router = APIRouter()
@@ -67,6 +68,15 @@ async def pedir_llave(datos: PedidoLlave, request: Request):
 
     prestamo = registrar_prestamo(datos.aula_id, profesor, actividad, hasta, usuario)
     log("LLAVE", f"{aula['nombre']}: retirada por {profesor} ({actividad}) hasta {datos.hasta}")
+
+    # Avisa al dispensador físico que debe ir a buscar esta llave.
+    # Si el aula no tiene tag RFID, se ignora: el préstamo igual queda registrado.
+    if aula["rfid"]:
+        from routers.dispensador import _crear_solicitud
+        _crear_solicitud(aula, usuario, requiere_pin=False)
+    else:
+        log("DISPENSADOR", f"'{aula['nombre']}' sin tag RFID: el dispensador no la entregará")
+
     return {"ok": True, "prestamo": prestamo}
 
 
@@ -117,7 +127,7 @@ async def admin_crear_aula(datos: AulaNueva, request: Request):
 
 @router.patch("/admin/aulas/{aula_id}")
 async def admin_editar_aula(aula_id: int, datos: AulaEdicion, request: Request):
-    """Edita nombre, ubicación o estado activo de un aula."""
+    """Edita nombre, ubicación, estado activo o tag RFID de un aula."""
     autenticar_admin(request)
     if not aula_por_id(aula_id):
         raise HTTPException(status_code=404, detail="Ese aula no existe.")
@@ -128,6 +138,35 @@ async def admin_editar_aula(aula_id: int, datos: AulaEdicion, request: Request):
         raise HTTPException(status_code=400, detail=f"La ubicación no puede superar {AULA_UBICACION_MAX} caracteres.")
     aula = actualizar_aula(aula_id, campos)
     log("AULAS", f"Actualizada #{aula_id}: {campos}")
+    return {"ok": True, "aula": aula}
+
+
+@router.post("/admin/aulas/{aula_id}/rfid/{rfid}")
+async def admin_asignar_rfid(aula_id: int, rfid: str, request: Request):
+    """Asigna un tag RFID a un aula, rechazando tags ya usados por otra."""
+    autenticar_admin(request)
+    rfid = (rfid or "").strip()
+    if len(rfid) > 32:
+        raise HTTPException(status_code=400, detail="El tag RFID es demasiado largo.")
+    if not aula_por_id(aula_id):
+        raise HTTPException(status_code=404, detail="Ese aula no existe.")
+    dueno = aula_por_rfid(rfid) if rfid else None
+    if dueno and dueno["id"] != aula_id:
+        raise HTTPException(status_code=409,
+                            detail=f"Ese tag ya está asignado al aula '{dueno['nombre']}'.")
+    aula = asignar_rfid(aula_id, rfid)
+    log("AULAS", f"RFID de #{aula_id} -> {rfid or '(sin tag)'}")
+    return {"ok": True, "aula": aula}
+
+
+@router.delete("/admin/aulas/{aula_id}/rfid")
+async def admin_quitar_rfid(aula_id: int, request: Request):
+    """Quita el tag RFID asignado a un aula."""
+    autenticar_admin(request)
+    if not aula_por_id(aula_id):
+        raise HTTPException(status_code=404, detail="Ese aula no existe.")
+    aula = asignar_rfid(aula_id, "")
+    log("AULAS", f"RFID de #{aula_id} eliminado")
     return {"ok": True, "aula": aula}
 
 

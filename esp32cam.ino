@@ -1,3 +1,13 @@
+/*
+ * ============================================================
+ *  ESP32-CAM - RECONOCIMIENTO FACIAL (para Arduino IDE)
+ * ============================================================
+ *  Placa: AI Thinker ESP32-CAM
+ *  Envía JPEG crudo a /reconocimiento con header X-Casillero-Id
+ *  Espera JSON: {"modo":"registro"} o {"autorizado":true,"persona":"..."}
+ * ============================================================
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -6,14 +16,14 @@
 #include "soc/rtc_cntl_reg.h"
 
 // =========================================================
-// CONFIGURACIÓN
+// CONFIGURACIÓN - MODIFICAR SEGÚN TU RED
 // =========================================================
 const char* ssid         = "PEINE-3";
 const char* password     = "etecPeine3";
-const char* serverUrl    = "http://10.56.13.16:8000/reconocimiento";
+const char* serverUrl    = "http://10.56.13.33:8000/reconocimiento";
 const char* CASILLERO_ID = "C01";
 
-
+// Tiempos (ms)
 const unsigned long TIEMPO_ENTRE_FOTOS   = 1000;   // modo reconocimiento
 const unsigned long TIEMPO_REGISTRO      = 300;    // modo registro (vista en vivo)
 const unsigned long PAUSA_TRAS_ACCESO_MS = 5000;
@@ -36,6 +46,9 @@ const unsigned long PAUSA_TRAS_ACCESO_MS = 5000;
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+// =========================================================
+// VARIABLES GLOBALES
+// =========================================================
 bool enRegistro = false;
 unsigned long proximoEscaneo = 0;
 unsigned long ultimoIntentoWiFi = 0;
@@ -44,7 +57,7 @@ unsigned long ultimoIntentoWiFi = 0;
 // CÁMARA
 // =========================================================
 void setupCamera() {
-  camera_config_t config = {};   // inicializa todos los campos en cero
+  camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer   = LEDC_TIMER_0;
@@ -143,7 +156,7 @@ void enviarFoto() {
 
   HTTPClient http;
   http.begin(serverUrl);
-  http.setTimeout(20000);   // en reconocimiento el servidor puede tardar unos segundos
+  http.setTimeout(20000);
   http.addHeader("Content-Type", "image/jpeg");
   http.addHeader("X-Casillero-Id", CASILLERO_ID);
 

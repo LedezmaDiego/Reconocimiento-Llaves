@@ -30,11 +30,12 @@ PB_URL = os.environ.get("PB_URL", "http://127.0.0.1:8090")
 PB_EMAIL = os.environ.get("PB_EMAIL", "")
 PB_PASSWORD = os.environ.get("PB_PASSWORD", "")
 COLECCION = "personal"
+COLECCION_SESIONES = "sesiones"
 
 # ---------------- Usuarios ----------------
 MAX_FOTOS_POR_USUARIO = 15
 REGISTRO_TIMEOUT_S = 120
-SESION_S = 1800
+SESION_S = 31536000    # 1 año (persistente en PocketBase)
 CODIGO_VALIDO_S = 30
 MAX_INTENTOS = 5
 BLOQUEO_S = 60

@@ -66,7 +66,7 @@ function Aula({ aula, onPedir, onDevolver, esMio }) {
   )
 }
 
-function FormPedido({ aula, usuario, onCerrar, onGuardado }) {
+function FormPedido({ aula, usuario, token, onCerrar, onGuardado }) {
   const [datos, setDatos] = useState({ profesor: usuario, actividad: '', hasta: '' })
   const [error, setError] = useState('')
   const [enviando, setEnviando] = useState(false)
@@ -76,7 +76,7 @@ function FormPedido({ aula, usuario, onCerrar, onGuardado }) {
     setEnviando(true)
     setError('')
     try {
-      await api('/aulas/pedir', { method: 'POST', body: { aula_id: aula.id, ...datos } })
+      await api('/aulas/pedir', { method: 'POST', token, body: { aula_id: aula.id, ...datos } })
       onGuardado(aula.nombre)
     } catch (e) { setError(e.message); setEnviando(false) }
   }
@@ -310,7 +310,8 @@ export function Panel({ sesion, onSalir }) {
         <section className="card"><h2>Mis fotos</h2><div className="grid">{fotos.length ? fotos.map((foto) => <Foto key={foto.archivo} {...foto} token={sesion.token} onDelete={borrar} />) : <p className="mut">Todavía no tenés fotos.</p>}</div></section>
       </>}
 
-      {pedido && <FormPedido aula={pedido} usuario={sesion.usuario} onCerrar={() => setPedido(null)} onGuardado={pedidoGuardado} />}
+      {pedido && <FormPedido aula={pedido} usuario={sesion.usuario} token={sesion.token}
+                              onCerrar={() => setPedido(null)} onGuardado={pedidoGuardado} />}
     </main>
   )
 }

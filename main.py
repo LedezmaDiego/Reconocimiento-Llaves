@@ -11,7 +11,7 @@ from db import init_db
 from estado import BASE_EMBEDDINGS
 from fotos import worker_pendientes
 from logs import log
-from pocketbase import asegurar_coleccion
+from pocketbase import asegurar_coleccion, asegurar_coleccion_sesiones, limpiar_sesiones_expiradas
 from reconocimiento import sincronizar_base
 from routers.placa import router_reconocimiento, router_movimientos
 from routers.usuarios import router as router_usuarios
@@ -19,6 +19,7 @@ from routers.paginas import router as router_paginas
 from routers.admin import router as router_admin
 from routers.captura import router as router_captura
 from routers.aulas import router as router_aulas
+from routers.dispensador import router as router_dispensador
 
 app = FastAPI()
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets"), check_dir=False),
@@ -44,6 +45,8 @@ async def startup_event() -> None:
     init_db()
     try:
         await run_in_threadpool(asegurar_coleccion)
+        await run_in_threadpool(asegurar_coleccion_sesiones)
+        await run_in_threadpool(limpiar_sesiones_expiradas)
     except HTTPException:
         log("POCKETBASE", f"¡No pude conectar! Revisá PB_URL, PB_EMAIL y PB_PASSWORD.")
     os.makedirs(DIRECTORIO_CARAS, exist_ok=True)
@@ -74,6 +77,7 @@ app.router.routes.extend(router_admin.routes)
 app.router.routes.extend(router_captura.routes)
 app.router.routes.extend(router_movimientos.routes)
 app.router.routes.extend(router_aulas.routes)
+app.router.routes.extend(router_dispensador.routes)
 
 
 if __name__ == "__main__":

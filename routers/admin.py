@@ -1,12 +1,10 @@
 import hmac
 import os
-import secrets
-import time
 from fastapi import APIRouter, Request, HTTPException
 
 from config import (ADMIN_SOLO_LOCAL, CLAVE_ADMIN, ADMIN_SESION_S, COLECCION,
                     DIRECTORIO_CARAS, DIRECTORIO_PENDIENTES)
-from estado import INTENTOS, SESIONES_ADMIN, SESIONES, _CACHE_ESTADO, LOCK_BASE, BASE_EMBEDDINGS
+from estado import INTENTOS, _CACHE_ESTADO, LOCK_BASE, BASE_EMBEDDINGS
 from fotos import archivos_de, pendientes_de
 from logs import log
 from pocketbase import pb, pb_usuario
@@ -17,7 +15,7 @@ router = APIRouter()
 
 @router.post("/admin/login")
 async def admin_login(datos: AdminLogin, request: Request):
-    """Autentica al administrador y emite un token de sesión."""
+    """Autentica al administrador y emite un token de sesión persistente."""
     if ADMIN_SOLO_LOCAL and not es_local(request):
         raise HTTPException(status_code=404, detail="No encontrado")
     clave_int = f"admin:{request.client.host if request.client else '?'}"
@@ -26,11 +24,8 @@ async def admin_login(datos: AdminLogin, request: Request):
         registrar_fallo(clave_int)
         raise HTTPException(status_code=401, detail="Contraseña incorrecta")
     INTENTOS.pop(clave_int, None)
-    ahora = time.time()
-    for t in [t for t, exp in SESIONES_ADMIN.items() if exp < ahora]:
-        SESIONES_ADMIN.pop(t, None)
-    token = secrets.token_hex(24)
-    SESIONES_ADMIN[token] = ahora + ADMIN_SESION_S
+    from seguridad import crear_sesion
+    token = crear_sesion("admin", tipo="admin")
     log("ADMIN", f"Sesión de administrador iniciada")
     return {"token": token}
 
@@ -73,8 +68,15 @@ async def admin_eliminar(usuario: str, request: Request):
         if r.status_code not in (200, 204):
             raise HTTPException(status_code=503, detail="No se pudo eliminar el usuario.")
     _CACHE_ESTADO.pop(usuario, None)
-    for t in [t for t, (u, _) in SESIONES.items() if u == usuario]:
-        SESIONES.pop(t, None)
+    # Borrar sesiones del usuario en PocketBase
+    try:
+        r = pb("GET", f"/api/collections/sesiones/records",
+               params={"filter": f'usuario="{usuario}"', "perPage": 500})
+        if r.status_code == 200:
+            for item in r.json().get("items", []):
+                pb("DELETE", f"/api/collections/sesiones/records/{item['id']}")
+    except Exception:
+        pass
     for carpeta, lista in ((DIRECTORIO_CARAS, archivos_de(usuario)), (DIRECTORIO_PENDIENTES, pendientes_de(usuario))):
         for f in lista:
             try:

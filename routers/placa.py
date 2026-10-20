@@ -10,11 +10,12 @@ from config import (BASE_DIR, CASILLERO_DEFECTO, CODIGO_VALIDO_S, UMBRAL,
                     VENTANA_RETIRO_S, MIN_BYTES_IMAGEN)
 from db import db, registrar_estado
 from estado import (ACCESO_CODIGO, LOGIN_ROSTRO, ULTIMA_AUTORIZACION, ULTIMA_FOTO,
-                    ULTIMO_RESULTADO, modo_actual)
+                    ULTIMO_RESULTADO, SOLICITUD_LLAVE, modo_actual)
 from logs import log
 from reconocimiento import comparar_rostro
 from schemas import EventoCasillero
 from seguridad import crear_sesion
+from routers.dispensador import _registrar_fallo_rostro, _registrar_acierto_rostro
 
 router_reconocimiento = APIRouter()
 router_movimientos = APIRouter()
@@ -89,11 +90,16 @@ async def reconocer_rostro(request: Request):
             return {"status": "error", "modo": "reconocimiento",
                     "mensaje": "No hay fotos de referencia válidas en el sistema."}
 
+        # Si hay una solicitud de llave activa, los fallos de rostro se cuentan contra ella.
+        aula_solicitada = SOLICITUD_LLAVE.get("aula_id") if SOLICITUD_LLAVE.get("activa") else None
+
         if res["autorizado"]:
             ULTIMA_AUTORIZACION[casillero_id] = (res["persona"], time.time())
             ULTIMO_RESULTADO["texto"] = f"ACCESO PERMITIDO: {res['persona']} ({datetime.now().strftime('%H:%M:%S')})"
             log("ACCESO PERMITIDO", f"{res['persona']} (dist: {res['distancia']:.3f})")
             print("-" * 60)
+            if aula_solicitada and res["persona"].lower() == SOLICITUD_LLAVE.get("persona", "").lower():
+                _registrar_acierto_rostro(aula_solicitada, res["persona"])
             return {"status": "success", "modo": "reconocimiento", "autorizado": True,
                     "persona": res["persona"], "metodo": "rostro",
                     "mensaje": f"Bienvenido/a, {res['persona']}.", "distancia": res["distancia"]}
@@ -107,8 +113,20 @@ async def reconocer_rostro(request: Request):
             motivo = "No se detectó ningún rostro."
         ULTIMO_RESULTADO["texto"] = f"Denegado: {motivo} ({datetime.now().strftime('%H:%M:%S')})"
         print("-" * 60)
+
+        # Cuenta el fallo contra la solicitud de llave activa (5 fallos -> pide PIN).
+        requiere_pin = False
+        if aula_solicitada:
+            restantes = _registrar_fallo_rostro(aula_solicitada)
+            if restantes <= 0:
+                SOLICITUD_LLAVE["requiere_pin"] = True
+                requiere_pin = True
+        else:
+            requiere_pin = False
+
         return {"status": "success", "modo": "reconocimiento", "autorizado": False,
-                "persona": "Desconocido", "mensaje": motivo}
+                "persona": "Desconocido", "mensaje": motivo,
+                "requiere_pin": requiere_pin}
     except Exception as e:
         log("ERROR GENERAL", f"{e}")
         print("-" * 60)
