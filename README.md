@@ -73,7 +73,7 @@ Desde la red (ESP32-CAM, dispenser, otros equipos): usá la IP del servidor, por
 |------------|-------------|
 | **FastAPI** | Servidor principal (`main.py`) |
 | **PocketBase** | Usuarios, PINs, aprobaciones y sesiones |
-| **ESP32-CAM** | Cámara de reconocimiento (`esp32cam.ino`) |
+| **ESP32-CAM** | Cámara de reconocimiento (`llavero_esp32cam.ino`) |
 | **ESP32 Dispensador** | Carrusel motorizado + RFID + LCD (`dispensador.ino`) |
 | **Frontend React** | Vistas `/registro` y `/admin` |
 
@@ -92,7 +92,7 @@ Desde la red (ESP32-CAM, dispenser, otros equipos): usá la IP del servidor, por
 ├── seguridad.py           # PIN, sesiones, tokens
 ├── schemas.py             # Modelos Pydantic
 ├── logs.py                # Logging
-├── esp32cam.ino           # Firmware cámara (Arduino IDE)
+├── llavero_esp32cam.ino   # Firmware cámara (Arduino IDE)
 ├── dispensador.ino        # Firmware dispensador (Arduino IDE)
 ├── frontend/              # React + Vite
 ├── routers/               # Endpoints por dominio
@@ -113,7 +113,7 @@ Desde la red (ESP32-CAM, dispenser, otros equipos): usá la IP del servidor, por
 
 ## Firmware
 
-### ESP32-CAM (`esp32cam.ino`)
+### ESP32-CAM (`llavero_esp32cam.ino`)
 Abrir en Arduino IDE con placa **AI Thinker ESP32-CAM** y PSRAM habilitada.
 
 ```cpp
