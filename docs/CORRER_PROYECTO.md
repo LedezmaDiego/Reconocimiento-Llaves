@@ -165,3 +165,12 @@ cp -r /home/etec/Reconocimiento-Llaves/personas_autorizadas ~/backup_fotos_$(dat
 ---
 
 **¡Listo!** Con las 3 terminales abiertas y la placa conectada, el sistema queda funcionando de punta a punta.
+
+
+cd ~/Reconocimiento-Llaves
+source venv/bin/activate
+ADMIN_CLAVE="LlaveroPanel2026!" \
+PB_EMAIL="admin@llavero.local" \
+PB_PASSWORD="LlaveroAdmin2026!" \
+PB_URL="http://127.0.0.1:8090" \
+python backend/main.py
