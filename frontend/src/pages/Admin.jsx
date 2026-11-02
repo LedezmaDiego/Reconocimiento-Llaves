@@ -143,6 +143,163 @@ function PestanaAulas({ token }) {
   </>
 }
 
+// ============================================================
+//  Llaveros RFID: alta por escaneo o a mano (campos uid y numero_aula)
+// ============================================================
+const TAG_VACIO = { uid: '', numero_aula: '' }
+
+function FilaTag({ tag, guardar, borrar }) {
+  const [edicion, setEdicion] = useState(null)
+
+  if (edicion) {
+    return (
+      <div className="fila">
+        <div className="crecer">
+          <input value={edicion.uid} placeholder="UID"
+                 onChange={(e) => setEdicion({ ...edicion, uid: e.target.value })} />
+          <input value={edicion.numero_aula} placeholder="Número de aula"
+                 onChange={(e) => setEdicion({ ...edicion, numero_aula: e.target.value })} />
+        </div>
+        <div className="acciones">
+          <button className="ok chico" onClick={() => { guardar(tag.id, edicion); setEdicion(null) }}>Guardar</button>
+          <button className="ghost chico" onClick={() => setEdicion(null)}>Cancelar</button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="fila">
+      <div>
+        <strong>Aula {tag.numero_aula}</strong>
+        <div className="mut">UID {tag.uid}</div>
+      </div>
+      <div className="acciones">
+        <button className="ghost chico" onClick={() => setEdicion({ uid: tag.uid, numero_aula: tag.numero_aula })}>Editar</button>
+        <button className="rojo chico" onClick={() => borrar(tag)}>Borrar</button>
+      </div>
+    </div>
+  )
+}
+
+function PestanaTags({ token }) {
+  const [tags, setTags] = useState([])
+  const [form, setForm] = useState(TAG_VACIO)
+  const [escaneando, setEscaneando] = useState(false)
+  const [aviso, setAviso] = useState(null)
+  const [version, setVersion] = useState(0)
+
+  useEffect(() => {
+    let activo = true
+    async function cargar() {
+      try {
+        const lista = await api('/admin/tags', { adminToken: token })
+        if (activo) setTags(lista)
+      } catch (error) {
+        if (activo) setAviso({ texto: error.message, tipo: 'err' })
+      }
+    }
+    cargar()
+    return () => { activo = false }
+  }, [token, version])
+
+  // Mientras se espera la tarjeta, consulta el estado cada segundo.
+  useEffect(() => {
+    if (!escaneando) return
+    let activo = true
+    const timer = setInterval(async () => {
+      try {
+        const e = await api('/admin/escaneo', { adminToken: token })
+        if (!activo || e.activo) return
+        setEscaneando(false)
+        if (e.uid) {
+          setForm((f) => ({ ...f, uid: e.uid }))
+          setAviso(e.ya_registrado
+            ? { texto: `La tarjeta ${e.uid} ya está registrada. Buscala en la lista para editarla.`, tipo: 'err' }
+            : { texto: `Tarjeta leída: ${e.uid}. Escribí el número de aula y guardá.`, tipo: 'info' })
+        } else {
+          setAviso({ texto: 'No se leyó ninguna tarjeta (se agotó el tiempo).', tipo: 'err' })
+        }
+      } catch (error) {
+        if (activo) { setEscaneando(false); setAviso({ texto: error.message, tipo: 'err' }) }
+      }
+    }, 1000)
+    return () => { activo = false; clearInterval(timer) }
+  }, [escaneando, token])
+
+  async function iniciarEscaneo() {
+    try {
+      await api('/admin/escaneo/iniciar', { method: 'POST', adminToken: token })
+      setAviso({ texto: 'Apoyá el llavero en el lector del dispensador (30 segundos).', tipo: 'info' })
+      setEscaneando(true)
+    } catch (error) { setAviso({ texto: error.message, tipo: 'err' }) }
+  }
+
+  async function cancelarEscaneo() {
+    try {
+      await api('/admin/escaneo/cancelar', { method: 'POST', adminToken: token })
+    } catch { /* si falla, igual se corta la espera en pantalla */ }
+    setEscaneando(false)
+    setAviso(null)
+  }
+
+  async function crear(evento) {
+    evento.preventDefault()
+    try {
+      await api('/admin/tags', { method: 'POST', adminToken: token, body: form })
+      setForm(TAG_VACIO)
+      setAviso({ texto: 'Llavero guardado.', tipo: 'info' })
+      setVersion((v) => v + 1)
+    } catch (error) { setAviso({ texto: error.message, tipo: 'err' }) }
+  }
+
+  async function guardar(tagId, campos) {
+    try {
+      await api(`/admin/tags/${tagId}`, { method: 'PATCH', adminToken: token, body: campos })
+      setAviso(null)
+      setVersion((v) => v + 1)
+    } catch (error) { setAviso({ texto: error.message, tipo: 'err' }) }
+  }
+
+  async function borrar(tag) {
+    if (!window.confirm(`¿Borrar el llavero del aula ${tag.numero_aula} (${tag.uid})? No se puede deshacer.`)) return
+    try {
+      await api(`/admin/tags/${tag.id}`, { method: 'DELETE', adminToken: token })
+      setVersion((v) => v + 1)
+    } catch (error) { setAviso({ texto: error.message, tipo: 'err' }) }
+  }
+
+  return <>
+    {aviso && <div role="status" className={`aviso ${aviso.tipo}`}>{aviso.texto}</div>}
+    <section className="card">
+      <h2>Agregar llavero</h2>
+      <div className="acciones">
+        {!escaneando
+          ? <button type="button" onClick={iniciarEscaneo}>Escanear tarjeta</button>
+          : <button type="button" className="ghost" onClick={cancelarEscaneo}>Cancelar escaneo</button>}
+      </div>
+      {escaneando && <p className="mut">Esperando llavero en el dispensador…</p>}
+      <form onSubmit={crear}>
+        <label>UID
+          <input value={form.uid} placeholder="Escaneá o escribilo (ej. CAA8EA81)"
+                 onChange={(e) => setForm({ ...form, uid: e.target.value })} required />
+        </label>
+        <label>Número de aula
+          <input value={form.numero_aula} placeholder="Ej. 214" inputMode="numeric"
+                 onChange={(e) => setForm({ ...form, numero_aula: e.target.value })} required />
+        </label>
+        <button>Guardar llavero</button>
+      </form>
+    </section>
+    <section className="card">
+      <h2>Llaveros <span className="badge b-aprobado">{tags.length}</span></h2>
+      {tags.length
+        ? tags.map((t) => <FilaTag key={t.id} tag={t} guardar={guardar} borrar={borrar} />)
+        : <p className="mut">Todavía no hay llaveros.</p>}
+    </section>
+  </>
+}
+
 function PestanaUsuarios({ token }) {
   const [usuarios, setUsuarios] = useState([])
   const [aviso, setAviso] = useState(null)
@@ -265,10 +422,13 @@ export function Admin() {
           <div className="acciones">
             <button className={pestana === 'usuarios' ? 'chico' : 'ghost chico'} onClick={() => setPestana('usuarios')}>Usuarios</button>
             <button className={pestana === 'aulas' ? 'chico' : 'ghost chico'} onClick={() => setPestana('aulas')}>Aulas y llaves</button>
+            <button className={pestana === 'tags' ? 'chico' : 'ghost chico'} onClick={() => setPestana('tags')}>Llaveros RFID</button>
           </div>
           <button className="ghost chico" onClick={() => cerrar()}>Salir</button>
         </div>
-        {pestana === 'usuarios' ? <PestanaUsuarios token={token} /> : <PestanaAulas token={token} />}
+        {pestana === 'usuarios' && <PestanaUsuarios token={token} />}
+        {pestana === 'aulas' && <PestanaAulas token={token} />}
+        {pestana === 'tags' && <PestanaTags token={token} />}
       </>}
     </main>
   )

@@ -1,10 +1,12 @@
 import time
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from config import MAX_INTENTOS
 from db import (aula_por_id, registrar_prestamo, prestamo_activo)
 from estado import SOLICITUD_LLAVE, LOCK_SOLICITUD, ULTIMA_AUTORIZACION, ULTIMO_EVENTO_DISPENSADOR
 from logs import log, obtener_hora
+from pocketbase import uids_activos, listar_tags
 from schemas import PedidoDispensador, PinDispensador, EventoDispensador
 from seguridad import verificar_pin
 
@@ -18,7 +20,7 @@ def _limpiar_solicitud() -> None:
     """Reinicia la solicitud activa."""
     with LOCK_SOLICITUD:
         SOLICITUD_LLAVE.update({"activa": False, "aula_id": None, "aula_nombre": "",
-                                "persona": "", "rfid": "", "requiere_pin": False,
+                                "persona": "", "rfid": "", "rfids": [], "requiere_pin": False,
                                 "intentos_rostro": 0, "creada": 0.0})
 
 
@@ -28,19 +30,23 @@ def _snapshot_solicitud() -> dict:
         return dict(SOLICITUD_LLAVE)
 
 
-def _crear_solicitud(aula: dict, persona: str, requiere_pin: bool) -> None:
+def _crear_solicitud(aula: dict, persona: str, requiere_pin: bool, uids: list[str] | None = None) -> None:
     """Marca la solicitud activa para que el ESP32 vaya a buscar la llave.
 
     No valida préstamos: el llamador decide si corresponde (el pedido web ya
-    registra el préstamo antes de llamar a esto).
+    registra el préstamo antes de llamar a esto). Si no se pasan los UIDs,
+    se consultan (tags activos de PocketBase + rfid viejo).
     """
+    if uids is None:
+        uids = uids_activos(aula["id"], aula["rfid"])
     with LOCK_SOLICITUD:
         SOLICITUD_LLAVE.update({"activa": True, "aula_id": aula["id"],
                                 "aula_nombre": aula["nombre"], "persona": persona,
-                                "rfid": aula["rfid"], "requiere_pin": requiere_pin,
+                                "rfid": uids[0] if uids else "", "rfids": uids,
+                                "requiere_pin": requiere_pin,
                                 "intentos_rostro": 0, "creada": time.time()})
     _INTENTOS_ROSTRO.pop(aula["id"], None)
-    log("DISPENSADOR", f"Solicitud activa para '{aula['nombre']}' (rfid {aula['rfid']})")
+    log("DISPENSADOR", f"Solicitud activa para '{aula['nombre']}' (uids {uids})")
 
 
 def _registrar_fallo_rostro(aula_id: int) -> int:
@@ -74,12 +80,15 @@ async def obtener_solicitud() -> dict:
         return {"activa": False}
 
     aula = aula_por_id(sol["aula_id"]) or {}
+    # Se vuelve a consultar en cada pedido: si desactivás un tag roto, deja de valer enseguida.
+    uids = await run_in_threadpool(uids_activos, sol["aula_id"], aula.get("rfid", ""))
     return {
         "activa": True,
         "aula_id": sol["aula_id"],
         "aula_nombre": aula.get("nombre", sol["aula_nombre"]),
         "persona": sol["persona"],
-        "rfid": aula.get("rfid", ""),
+        "rfid": uids[0] if uids else "",
+        "rfids": uids,
         "requiere_pin": sol["requiere_pin"],
         "intentos_rostro": sol["intentos_rostro"],
     }
@@ -93,13 +102,14 @@ async def solicitar_llave(datos: PedidoDispensador) -> dict:
         return {"ok": False, "error": "Ese aula no existe."}
     if not aula["activa"]:
         return {"ok": False, "error": "Ese aula está deshabilitada."}
-    if not aula["rfid"]:
+    uids = await run_in_threadpool(uids_activos, aula["id"], aula["rfid"])
+    if not uids:
         return {"ok": False, "error": f"El aula '{aula['nombre']}' no tiene tag RFID asignado."}
     if prestamo_activo(datos.aula_id):
         return {"ok": False, "error": "Esa llave todavía no fue devuelta."}
 
-    _crear_solicitud(aula, datos.persona, datos.requiere_pin)
-    return {"ok": True, "aula_nombre": aula["nombre"], "rfid": aula["rfid"]}
+    _crear_solicitud(aula, datos.persona, datos.requiere_pin, uids=uids)
+    return {"ok": True, "aula_nombre": aula["nombre"], "rfid": uids[0], "rfids": uids}
 
 
 @router.post("/dispensador/cancelar")
@@ -186,8 +196,14 @@ async def estado_dispensador() -> dict:
     """Estado actual del dispensador para el panel de administración."""
     from db import aulas
     sol = _snapshot_solicitud()
+    # Una sola consulta a PocketBase para todos los tags, agrupados por aula.
+    try:
+        tags = await run_in_threadpool(listar_tags)
+    except Exception:
+        tags = []
+    con_tag = {str(t["llave_id"]) for t in tags if t.get("activo") and t.get("llave_id")}
     return {
         "solicitud": sol,
         "ultimo_evento": dict(ULTIMO_EVENTO_DISPENSADOR),
-        "aulas": [{**a, "tiene_rfid": bool(a["rfid"])} for a in aulas()],
+        "aulas": [{**a, "tiene_rfid": bool(a["rfid"]) or str(a["id"]) in con_tag} for a in aulas()],
     }

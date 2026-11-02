@@ -62,7 +62,16 @@ def aula_por_id(aula_id: int) -> dict | None:
     return dict(fila) if fila else None
 
 def aula_por_rfid(rfid: str) -> dict | None:
-    """Devuelve el aula asociada a un tag RFID, o None."""
+    """Devuelve el aula asociada a un tag RFID (primero tags de PocketBase, luego columna legacy)."""
+    from pocketbase import tag_por_uid          # import local: evita ciclos
+    try:
+        tag = tag_por_uid(rfid)
+    except Exception:
+        tag = None                              # si PocketBase falla, cae al método viejo
+    if tag and str(tag.get("llave_id", "")).isdigit():
+        aula = aula_por_id(int(tag["llave_id"]))
+        if aula and aula["activa"]:
+            return aula
     with closing(db()) as con:
         fila = con.execute("SELECT * FROM aulas WHERE rfid = ? AND activa = 1", (rfid,)).fetchone()
     return dict(fila) if fila else None
@@ -131,5 +140,3 @@ def registrar_estado(casillero_id: str, estado: str, evento: str, persona: str |
                     (casillero_id, estado, persona, ahora))
         con.execute("INSERT INTO historial (casillero_id, evento, persona, fecha) VALUES (?, ?, ?, ?)",
                     (casillero_id, evento, persona, ahora))
-
-

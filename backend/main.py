@@ -11,7 +11,8 @@ from db import init_db
 from estado import BASE_EMBEDDINGS
 from fotos import worker_pendientes
 from logs import log
-from pocketbase import asegurar_coleccion, asegurar_coleccion_sesiones, limpiar_sesiones_expiradas
+from pocketbase import (asegurar_coleccion, asegurar_coleccion_sesiones, limpiar_sesiones_expiradas,
+                        asegurar_coleccion_fotos, asegurar_coleccion_tags)
 from reconocimiento import sincronizar_base
 from routers.placa import router_reconocimiento, router_movimientos
 from routers.usuarios import router as router_usuarios
@@ -20,6 +21,9 @@ from routers.admin import router as router_admin
 from routers.captura import router as router_captura
 from routers.aulas import router as router_aulas
 from routers.dispensador import router as router_dispensador
+from routers.tags import router as router_tags
+from routers.escaneo import router as router_escaneo
+from routers.llaves import router as router_llaves
 
 app = FastAPI()
 app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets"), check_dir=False),
@@ -29,12 +33,14 @@ app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")
 # aquí porque el contrato histórico las tenía vacías y no aportan información al cliente.
 _openapi_original = app.openapi
 
+
 def _openapi_sin_descripciones() -> dict:
     esquema = _openapi_original()
     for metodos in esquema.get("paths", {}).values():
         for operacion in metodos.values():
             operacion.pop("description", None)
     return esquema
+
 
 app.openapi = _openapi_sin_descripciones
 
@@ -46,9 +52,11 @@ async def startup_event() -> None:
     try:
         await run_in_threadpool(asegurar_coleccion)
         await run_in_threadpool(asegurar_coleccion_sesiones)
+        await run_in_threadpool(asegurar_coleccion_fotos)
+        await run_in_threadpool(asegurar_coleccion_tags)
         await run_in_threadpool(limpiar_sesiones_expiradas)
     except HTTPException:
-        log("POCKETBASE", f"¡No pude conectar! Revisá PB_URL, PB_EMAIL y PB_PASSWORD.")
+        log("POCKETBASE", "¡No pude conectar! Revisá PB_URL, PB_EMAIL y PB_PASSWORD.")
     os.makedirs(DIRECTORIO_CARAS, exist_ok=True)
     os.makedirs(DIRECTORIO_PENDIENTES, exist_ok=True)
     for f in os.listdir(DIRECTORIO_PENDIENTES):
@@ -58,12 +66,12 @@ async def startup_event() -> None:
     print("\n" + "=" * 60)
     log("SISTEMA", f"Iniciando servidor | modelo={MODELO} detector={DETECTOR} umbral={UMBRAL}")
     if CLAVE_ADMIN == "cambiame-admin":
-        log("SEGURIDAD", f"¡Estás usando la clave de admin por defecto! Definí ADMIN_CLAVE.")
+        log("SEGURIDAD", "¡Estás usando la clave de admin por defecto! Definí ADMIN_CLAVE.")
     await run_in_threadpool(sincronizar_base)
     personas = sorted({d["persona"] for d in BASE_EMBEDDINGS.values()})
     log("SISTEMA", f"Listo: {len(BASE_EMBEDDINGS)} fotos válidas, personas: {personas}")
-    log("SISTEMA", f"Usuarios:       http://IP_DE_ESTA_PC:8000/registro")
-    log("SISTEMA", f"Administración: http://IP_DE_ESTA_PC:8000/admin")
+    log("SISTEMA", "Usuarios:       http://IP_DE_ESTA_PC:8000/registro")
+    log("SISTEMA", "Administración: http://IP_DE_ESTA_PC:8000/admin")
     print("=" * 60 + "\n")
     threading.Thread(target=worker_pendientes, daemon=True).start()
 
@@ -78,8 +86,10 @@ app.router.routes.extend(router_captura.routes)
 app.router.routes.extend(router_movimientos.routes)
 app.router.routes.extend(router_aulas.routes)
 app.router.routes.extend(router_dispensador.routes)
+app.router.routes.extend(router_tags.routes)
+app.router.routes.extend(router_escaneo.routes)
+app.router.routes.extend(router_llaves.routes)
 
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-

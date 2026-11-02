@@ -1,35 +1,18 @@
 /*
  * ============================================================
- *  DISPENSADOR DE LLAVES - ESP32 (para Arduino IDE)
+ *  DISPENSADOR DE LLAVES - ESP32 (Arduino IDE)
  * ============================================================
- *  Componentes y conexiones (según tabla del proyecto):
+ *  MOTOR (L298N puente B):   IN3 -> GPIO25   IN4 -> GPIO26
+ *  ENCODER:                  GPIO34
+ *  RFID RC522 (3.3V):        SS=5 SCK=18 MOSI=23 MISO=19 RST=27
+ *  LCD I2C:                  SCL=22 SDA=21
+ *  TECLADO 4x4:              R=4,13,14,16  C=17,32,33,2
+ *  LED:                      R=12 G=15
  *
- *  MOTOR (L298N puente B, con jumpers puestos en ENA/ENB)
- *    IN3  -> GPIO25      IN4 -> GPIO26
- *    OUT3 -> Motor +     OUT4 -> Motor -
- *    La velocidad se controla por PWM sobre IN3 (el jumper de
- *    ENB queda puesto: la habilitación es permanente).
- *
- *  ENCODER del motor (1 señal)
- *    Señal -> GPIO34 (entrada only, OK para interrupción)
- *
- *  RFID RC522 (¡ALIMENTAR A 3.3V, con 5V se quema!)
- *    SS/SDA -> GPIO5     SCK  -> GPIO18
- *    MOSI   -> GPIO23    MISO -> GPIO19
- *    RST    -> GPIO27    IRQ  -> desconectado
- *
- *  LCD I2C
- *    SCL -> GPIO22       SDA -> GPIO21
- *
- *  TECLADO 4x4 (filas / columnas)
- *    R1..R4 -> GPIO4, 13, 14, 16
- *    C1..C4 -> GPIO17, 32, 33, 2
- *
- *  LED HW-480 (con resistencia 220 en serie en cada color)
- *    R -> GPIO12         G -> GPIO15
- *
- *  NOTA: los pines coinciden 1:1 con la tabla; NO cambiar sin
- *  revisar conflictos. Pines de entrada only del ESP32: 34-39.
+ *  Novedades:
+ *   - Acepta varios tags por llave (campo "rfids" del servidor).
+ *   - Modo escaneo: el admin pide escanear desde la web y el UID
+ *     se envía al backend (MAYÚSCULAS, sin separadores).
  * ============================================================
  */
 
@@ -41,45 +24,27 @@
 #include <MFRC522.h>
 #include <ArduinoJson.h>
 
-// ============================================================
-//  CONFIGURACIÓN DE RED
-// ============================================================
+// ===== RED =====
 const char* WIFI_SSID      = "PEINE-3";
 const char* WIFI_PASSWORD  = "etecPeine3";
-const char* SERVER_URL     = "http://10.56.13.16:8000";   // PC que corre FastAPI
-const char* DISPENSADOR_ID = "D01";                       // identificador de este equipo
+const char* SERVER_URL     = "http://10.56.16.12:8000";   // IP de la PC del backend
+const char* DISPENSADOR_ID = "D01";
 
-// ============================================================
-//  PINES
-// ============================================================
-// Motor (puente B del L298N; ENB con jumper = siempre habilitado)
+// ===== PINES =====
 #define PIN_IN3      25
 #define PIN_IN4      26
-#define VEL_MOTOR   200      // PWM 0-255 para IN3
-
-// Encoder (1 canal)
-#define PIN_ENCODER  34      // GPIO34: entrada only, válida para interrupción
-
-// RC522
+#define VEL_MOTOR   200
+#define PIN_ENCODER  34
 #define PIN_RFID_SS   5
 #define PIN_RFID_RST 27
-
-// LCD I2C
 #define LCD_ADDR    0x27
 #define LCD_COLS    16
 #define LCD_ROWS     2
-
-// Teclado 4x4
 const byte FILAS[4]    = { 4, 13, 14, 16};
 const byte COLUMNAS[4] = {17, 32, 33,  2};
-
-// LED HW-480
 #define PIN_LED_R    12
 #define PIN_LED_G    15
 
-// ============================================================
-//  MAPA DEL TECLADO
-// ============================================================
 char teclas[4][4] = {
   {'1','2','3','A'},
   {'4','5','6','B'},
@@ -87,147 +52,120 @@ char teclas[4][4] = {
   {'*','0','#','D'}
 };
 
-// ============================================================
-//  PARÁMETROS DEL SISTEMA
-// ============================================================
-const unsigned long TIMEOUT_PETICION_MS = 15000;   // espera respuesta del servidor
-const unsigned long TIMEOUT_SESION_MS   = 60000;   // inactividad -> pantalla inicio
-const unsigned long TIMEOUT_GIRO_MS     = 10000;   // tope de girando buscando llave
-const unsigned long TIEMPO_RETIRO_MS    = 8000;    // ventana para retirar la llave
-const int           MAX_INTENTOS_PIN    = 3;       // intentos de PIN en el teclado
-const int           PULSOS_POR_VUELTA   = 20;      // CALIBRAR: pulsos del encoder por vuelta
-const unsigned long REINTENTO_GIRO_MS   = 60000;   // tras no encontrar, espera antes de reintentar
+// ===== PARÁMETROS =====
+const unsigned long TIMEOUT_PETICION_MS   = 15000;
+const unsigned long TIMEOUT_SESION_MS     = 60000;
+const unsigned long TIMEOUT_GIRO_MS       = 10000;
+const unsigned long TIEMPO_RETIRO_MS      = 8000;
+const int           MAX_INTENTOS_PIN      = 3;
+const int           PULSOS_POR_VUELTA     = 20;   // CALIBRAR
+const unsigned long CONSULTA_SOLICITUD_MS = 3000;
+const unsigned long CONSULTA_ESCANEO_MS   = 1000;
+const int           MAX_TAGS              = 8;
 
-// ============================================================
-//  ESTRUCTURAS
-// ============================================================
+// ===== ESTRUCTURAS =====
 struct SolicitudLlave {
-  bool     activa        = false;
-  int      aulaId        = 0;
-  String   aulaNombre    = "";
-  String   persona       = "";
-  String   rfidObjetivo  = "";
-  bool     requierePin   = false;
+  bool   activa      = false;
+  int    aulaId      = 0;
+  String aulaNombre  = "";
+  String persona     = "";
+  String rfids[MAX_TAGS];
+  int    nRfids      = 0;
+  bool   requierePin = false;
 };
 
 struct EstadoDispensador {
-  bool   motorGirando    = false;
-  long   pulsosEncoder   = 0;
-  int    intentosPin     = 0;
-  String ultimaAccion    = "";
+  bool motorGirando = false;
+  volatile long pulsosEncoder = 0;
+  int  intentosPin  = 0;
 };
 
-// ============================================================
-//  OBJETOS GLOBALES
-// ============================================================
 LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
 Keypad teclado = Keypad(makeKeymap(teclas), FILAS, COLUMNAS, 4, 4);
 MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
 
-SolicitudLlave   solicitud;
+SolicitudLlave    solicitud;
 EstadoDispensador estado;
 
-unsigned long ultimaPeticionMs = 0;   // última consulta de /solicitud
-unsigned long ultimaAccionMs   = 0;   // última tecla (para el timeout de sesión)
+unsigned long ultimaPeticionMs         = 0;
+unsigned long ultimaConsultaEscaneoMs  = 0;
+unsigned long ultimaAccionMs           = 0;
+bool modoEscaneo = false;
 
-String  bufferAula, bufferPin;
-int     pantalla = 0;   // 0 inicio, 1 aula, 2 PIN, 3 girando, 4 entregado, 5 error
+String bufferAula, bufferPin;
+int pantalla = 0;   // 0 inicio, 1 aula, 2 PIN, 3 girando, 4 entregado, 5 error
 
-// ============================================================
-//  PROTOTIPOS
-// ============================================================
+// ===== PROTOTIPOS =====
 void setupWiFi();
 void mantenerWiFi();
 void mostrarEnLCD(const String& l1, const String& l2 = "");
-
-void ledRojo();
-void ledVerde();
-void ledAzul();
-void ledAmbar();
-void ledApagado();
-
+void ledRojo(); void ledVerde(); void ledAzul(); void ledAmbar(); void ledApagado();
 void IRAM_ATTR encoderISR();
 void girarMotor(int velocidad);
 void detenerMotor();
-
 String leerRFID();
-bool   buscarYLlevarLlave();
-
-bool   peticionSolicitud();
-bool   validarPinEnServidor(const String& pin);
-bool   notificarEvento(const String& evento, const String& detalle = "");
+bool buscarYLlevarLlave();
+bool peticionSolicitud();
+bool validarPinEnServidor(const String& pin);
+bool notificarEvento(const String& evento, const String& detalle = "");
 String peticionHTTP(const String& endpoint, const String& metodo,
                     const String& cuerpo, const String& tipoContenido);
-
-void dibujarInicio();
-void dibujarAula();
-void dibujarPin();
-void dibujarGirando();
-void dibujarEntregado(const String& aula);
-void dibujarError(const String& mensaje);
+bool esTagObjetivo(const String& uid);
+void gestionarEscaneo();
+void dibujarInicio(); void dibujarAula(); void dibujarPin(); void dibujarGirando();
+void dibujarEntregado(const String& aula); void dibujarError(const String& mensaje);
 void procesarTecla(char tecla);
 void resetSesion();
 
-// ============================================================
-//  SETUP
-// ============================================================
+// ===== SETUP =====
 void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("\n\n=== DISPENSADOR DE LLAVES ===");
 
-  // Motor
   pinMode(PIN_IN3, OUTPUT);
   pinMode(PIN_IN4, OUTPUT);
   detenerMotor();
 
-  // Encoder (GPIO34 no tiene pull-up interna: se usa resistencia externa)
   pinMode(PIN_ENCODER, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_ENCODER), encoderISR, RISING);
 
-  // LED
   pinMode(PIN_LED_R, OUTPUT);
   pinMode(PIN_LED_G, OUTPUT);
   ledApagado();
 
-  // LCD
   lcd.init();
   lcd.backlight();
   mostrarEnLCD("Iniciando...", "Dispensador ETEC");
 
-  // RFID
   SPI.begin();
   rfid.PCD_Init();
   Serial.println("RC522 listo");
 
-  // WiFi
   setupWiFi();
-
   pantalla = 0;
   dibujarInicio();
   Serial.println("Sistema listo.");
 }
 
-// ============================================================
-//  LOOP
-// ============================================================
+// ===== LOOP =====
 void loop() {
   mantenerWiFi();
 
-  // Consultar si el servidor tiene una llave para entregar (cada 3s).
-  if (WiFi.status() == WL_CONNECTED && millis() - ultimaPeticionMs > 3000) {
+  if (WiFi.status() == WL_CONNECTED && millis() - ultimaPeticionMs > CONSULTA_SOLICITUD_MS) {
     ultimaPeticionMs = millis();
     peticionSolicitud();
   }
 
-  // Teclado
+  // Modo escaneo: solo en pantalla de inicio (motor quieto)
+  if (pantalla == 0) gestionarEscaneo();
+
   char tecla = teclado.getKey();
   if (tecla) {
     procesarTecla(tecla);
     ultimaAccionMs = millis();
   }
 
-  // Timeout de sesión: vuelve al inicio si no hay actividad.
   if (pantalla != 0 && millis() - ultimaAccionMs > TIMEOUT_SESION_MS) {
     resetSesion();
   }
@@ -235,9 +173,7 @@ void loop() {
   delay(50);
 }
 
-// ============================================================
-//  WIFI
-// ============================================================
+// ===== WIFI =====
 void setupWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -272,9 +208,7 @@ void mantenerWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
-// ============================================================
-//  LCD
-// ============================================================
+// ===== LCD =====
 void mostrarEnLCD(const String& l1, const String& l2) {
   lcd.clear();
   lcd.setCursor(0, 0);
@@ -285,24 +219,18 @@ void mostrarEnLCD(const String& l1, const String& l2) {
   }
 }
 
-// ============================================================
-//  LED HW-480 (ánodo común: HIGH apaga, LOW enciende el color)
-//  Con resistencias de 220 en serie por color.
-// ============================================================
-void ledRojo()  { digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, LOW);  }
-void ledVerde() { digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, HIGH); }
-void ledAmbar() { digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, HIGH); }
-void ledAzul()  { digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, LOW);  }
-void ledApagado(){ digitalWrite(PIN_LED_R, LOW); digitalWrite(PIN_LED_G, LOW);  }
+// ===== LED (ánodo común: HIGH apaga, LOW enciende) =====
+void ledRojo()   { digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, LOW);  }
+void ledVerde()  { digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, HIGH); }
+void ledAmbar()  { digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, HIGH); }
+void ledAzul()   { digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, LOW);  }
+void ledApagado(){ digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, LOW);  }
 
-// ============================================================
-//  ENCODER + MOTOR
-// ============================================================
+// ===== ENCODER + MOTOR =====
 void IRAM_ATTR encoderISR() {
   estado.pulsosEncoder++;
 }
 
-// Giro en un sentido: IN3 con PWM (velocidad), IN4 en LOW.
 void girarMotor(int velocidad) {
   analogWrite(PIN_IN3, velocidad);
   digitalWrite(PIN_IN4, LOW);
@@ -315,9 +243,7 @@ void detenerMotor() {
   estado.motorGirando = false;
 }
 
-// ============================================================
-//  RFID
-// ============================================================
+// ===== RFID: UID en MAYÚSCULAS, sin separadores (ej. 04A32B1F) =====
 String leerRFID() {
   if (!rfid.PICC_IsNewCardPresent()) return "";
   if (!rfid.PICC_ReadCardSerial())   return "";
@@ -327,24 +253,27 @@ String leerRFID() {
     if (rfid.uid.uidByte[i] < 0x10) uid += "0";
     uid += String(rfid.uid.uidByte[i], HEX);
   }
+  uid.toUpperCase();
   rfid.PICC_HaltA();
   return uid;
 }
 
-// ============================================================
-//  HTTP
-// ============================================================
+bool esTagObjetivo(const String& uid) {
+  for (int i = 0; i < solicitud.nRfids; i++) {
+    if (uid.equalsIgnoreCase(solicitud.rfids[i])) return true;
+  }
+  return false;
+}
+
+// ===== HTTP =====
 String peticionHTTP(const String& endpoint, const String& metodo,
                     const String& cuerpo, const String& tipoContenido) {
   if (WiFi.status() != WL_CONNECTED) return "";
 
   HTTPClient http;
-  String url = String(SERVER_URL) + endpoint;
-  http.begin(url);
+  http.begin(String(SERVER_URL) + endpoint);
   http.setTimeout(TIMEOUT_PETICION_MS);
-  if (cuerpo.length() > 0) {
-    http.addHeader("Content-Type", tipoContenido);
-  }
+  if (cuerpo.length() > 0) http.addHeader("Content-Type", tipoContenido);
   http.addHeader("X-Dispensador-Id", DISPENSADOR_ID);
 
   int codigo = (metodo == "GET") ? http.GET() : http.POST(cuerpo);
@@ -359,12 +288,11 @@ String peticionHTTP(const String& endpoint, const String& metodo,
   return respuesta;
 }
 
-// ¿El servidor tiene una llave para entregar?
 bool peticionSolicitud() {
   String json = peticionHTTP("/dispensador/solicitud", "GET", "", "");
   if (json.isEmpty()) return false;
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   if (deserializeJson(doc, json)) {
     Serial.println("JSON inválido del servidor");
     return false;
@@ -376,21 +304,32 @@ bool peticionSolicitud() {
     return false;
   }
 
-  solicitud.activa       = true;
-  solicitud.aulaId       = doc["aula_id"]       | 0;
-  solicitud.aulaNombre   = doc["aula_nombre"].as<String>();
-  solicitud.persona      = doc["persona"].as<String>();
-  solicitud.rfidObjetivo = doc["rfid"].as<String>();
-  solicitud.requierePin  = doc["requiere_pin"]  | false;
+  solicitud.activa      = true;
+  solicitud.aulaId      = doc["aula_id"] | 0;
+  solicitud.aulaNombre  = doc["aula_nombre"].as<String>();
+  solicitud.persona     = doc["persona"].as<String>();
+  solicitud.requierePin = doc["requiere_pin"] | false;
 
-  Serial.printf("Solicitud: aula=%d (%s) rfid=%s pin=%s\n",
+  // Lista de tags válidos; si el servidor viejo no la manda, usa "rfid".
+  solicitud.nRfids = 0;
+  JsonArray lista = doc["rfids"].as<JsonArray>();
+  if (!lista.isNull()) {
+    for (JsonVariant v : lista) {
+      if (solicitud.nRfids >= MAX_TAGS) break;
+      solicitud.rfids[solicitud.nRfids++] = v.as<String>();
+    }
+  }
+  if (solicitud.nRfids == 0) {
+    String unico = doc["rfid"].as<String>();
+    if (unico.length() > 0) solicitud.rfids[solicitud.nRfids++] = unico;
+  }
+
+  Serial.printf("Solicitud: aula=%d (%s) tags=%d pin=%s\n",
                 solicitud.aulaId, solicitud.aulaNombre.c_str(),
-                solicitud.rfidObjetivo.c_str(),
-                solicitud.requierePin ? "SI" : "NO");
+                solicitud.nRfids, solicitud.requierePin ? "SI" : "NO");
   return true;
 }
 
-// Valida el PIN en el servidor (el hash y el bloqueo viven allá).
 bool validarPinEnServidor(const String& pin) {
   if (solicitud.persona.isEmpty()) {
     Serial.println("PIN: no hay persona en la solicitud");
@@ -407,60 +346,89 @@ bool validarPinEnServidor(const String& pin) {
   return resp.indexOf("\"ok\":true") >= 0;
 }
 
-// Informa un evento al servidor.
 bool notificarEvento(const String& evento, const String& detalle) {
   StaticJsonDocument<256> doc;
-  doc["evento"]    = evento;
-  doc["aula_id"]   = solicitud.aulaId;
-  doc["persona"]   = solicitud.persona;
-  doc["rfid"]      = solicitud.rfidObjetivo;
-  doc["detalle"]   = detalle;
+  doc["evento"]  = evento;
+  doc["aula_id"] = solicitud.aulaId;
+  doc["persona"] = solicitud.persona;
+  doc["rfid"]    = solicitud.nRfids > 0 ? solicitud.rfids[0] : "";
+  doc["detalle"] = detalle;
   String cuerpo;
   serializeJson(doc, cuerpo);
   return peticionHTTP("/dispensador/confirmar", "POST", cuerpo,
                       "application/json").length() > 0;
 }
 
-// ============================================================
-//  PANTALLAS
-// ============================================================
+// ===== MODO ESCANEO (alta de tags desde la web) =====
+void gestionarEscaneo() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (millis() - ultimaConsultaEscaneoMs > CONSULTA_ESCANEO_MS) {
+    ultimaConsultaEscaneoMs = millis();
+    String r = peticionHTTP("/dispensador/modo-escaneo", "GET", "", "");
+    bool activo = r.indexOf("\"activo\":true") >= 0;
+    if (activo && !modoEscaneo) {
+      mostrarEnLCD("Escaneo de tag", "Apoye la tarjeta");
+      ledAmbar();
+    } else if (!activo && modoEscaneo) {
+      dibujarInicio();
+    }
+    modoEscaneo = activo;
+  }
+
+  if (!modoEscaneo) return;
+
+  String uid = leerRFID();
+  if (uid.isEmpty()) return;
+
+  Serial.println("UID escaneado: " + uid);
+  StaticJsonDocument<96> doc;
+  doc["uid"] = uid;
+  String cuerpo;
+  serializeJson(doc, cuerpo);
+  String resp = peticionHTTP("/dispensador/escaneo", "POST", cuerpo, "application/json");
+
+  if (resp.indexOf("\"ok\":true") >= 0) {
+    mostrarEnLCD("Tag leido", uid);
+    ledVerde();
+  } else {
+    mostrarEnLCD("Escaneo fallido", "Reintente");
+    ledRojo();
+  }
+  modoEscaneo = false;
+  delay(2000);
+  dibujarInicio();
+}
+
+// ===== PANTALLAS =====
 void dibujarInicio() {
   mostrarEnLCD("Dispensador", "Listo");
   ledAzul();
 }
-
-void dibujarAula() {
-  mostrarEnLCD("Ingrese nro aula", "Aula:" + bufferAula + "  #");
-}
-
+void dibujarAula() { mostrarEnLCD("Ingrese nro aula", "Aula:" + bufferAula + "  #"); }
 void dibujarPin() {
   String oculto(bufferPin.length(), '*');
   mostrarEnLCD("Ingrese PIN:", oculto + " #");
 }
-
 void dibujarGirando() {
   mostrarEnLCD("Buscando llave", "Aula " + String(solicitud.aulaId));
   ledAmbar();
 }
-
 void dibujarEntregado(const String& aula) {
   mostrarEnLCD("Retire su llave", aula);
   ledVerde();
 }
-
 void dibujarError(const String& mensaje) {
   mostrarEnLCD("ERROR", mensaje);
   ledRojo();
 }
 
-// ============================================================
-//  TECLADO
-// ============================================================
+// ===== TECLADO =====
 void procesarTecla(char tecla) {
   Serial.printf("Tecla '%c' (pantalla %d)\n", tecla, pantalla);
 
   switch (pantalla) {
-    case 0:  // inicio: fuerza consulta y pasa a la pantalla que corresponda
+    case 0:
       if (peticionSolicitud() && solicitud.activa) {
         bufferAula = ""; bufferPin = "";
         estado.intentosPin = 0;
@@ -473,7 +441,7 @@ void procesarTecla(char tecla) {
       }
       break;
 
-    case 1:  // número de aula
+    case 1:
       if (tecla >= '0' && tecla <= '9') {
         if (bufferAula.length() < 3) {
           bufferAula += tecla;
@@ -497,7 +465,7 @@ void procesarTecla(char tecla) {
       }
       break;
 
-    case 2: {  // PIN
+    case 2: {
       if (tecla >= '0' && tecla <= '9') {
         if (bufferPin.length() < 6) {
           bufferPin += tecla;
@@ -528,7 +496,7 @@ void procesarTecla(char tecla) {
       break;
     }
 
-    case 3:  // girando: 'D' cancela
+    case 3:
       if (tecla == 'D') {
         detenerMotor();
         notificarEvento("error", "cancelado por el usuario");
@@ -537,40 +505,36 @@ void procesarTecla(char tecla) {
       break;
 
     case 4:
-    case 5:  // tras entregar o error, cualquier tecla vuelve al inicio
+    case 5:
       resetSesion();
       break;
   }
 }
 
-// ============================================================
-//  RESET
-// ============================================================
+// ===== RESET =====
 void resetSesion() {
   detenerMotor();
-  solicitud      = SolicitudLlave();
+  solicitud = SolicitudLlave();
   estado.intentosPin = 0;
-  bufferAula     = "";
-  bufferPin      = "";
-  pantalla       = 0;
+  bufferAula = "";
+  bufferPin  = "";
+  pantalla   = 0;
   dibujarInicio();
 }
 
-// ============================================================
-//  BÚSQUEDA DE LA LLAVE (gira + lee RFID)
-// ============================================================
+// ===== BÚSQUEDA DE LA LLAVE (gira + lee RFID) =====
 bool buscarYLlevarLlave() {
   pantalla = 3;
   dibujarGirando();
 
-  if (solicitud.rfidObjetivo.isEmpty()) {
+  if (solicitud.nRfids == 0) {
     notificarEvento("error", "el aula no tiene tag RFID");
     dibujarError("Llave sin tag");
     pantalla = 5;
     return false;
   }
 
-  long pulsosInicio    = estado.pulsosEncoder;
+  long pulsosInicio     = estado.pulsosEncoder;
   unsigned long tInicio = millis();
   bool encontrada       = false;
 
@@ -581,10 +545,8 @@ bool buscarYLlevarLlave() {
 
     String uid = leerRFID();
     if (!uid.isEmpty()) {
-      Serial.printf("RFID: %s (busco %s)\n", uid.c_str(), solicitud.rfidObjetivo.c_str());
-      if (uid.equalsIgnoreCase(solicitud.rfidObjetivo)) {
-        // Frenar y retroceder un poco para centrar la llave.
-        // El giro inverso se hace con IN4 en PWM (IN3 en LOW).
+      Serial.printf("RFID: %s\n", uid.c_str());
+      if (esTagObjetivo(uid)) {
         detenerMotor();
         delay(150);
         digitalWrite(PIN_IN3, LOW);
@@ -597,7 +559,6 @@ bool buscarYLlevarLlave() {
       }
     }
 
-    // Vuelta completa sin encontrarla: avisa y sale.
     if (estado.pulsosEncoder - pulsosInicio > PULSOS_POR_VUELTA) break;
     delay(30);
   }
@@ -615,12 +576,11 @@ bool buscarYLlevarLlave() {
   Serial.println("Llave posicionada");
   notificarEvento("encontrada", "posicionada");
 
-  // Espera a que retiren la llave.
   pantalla = 4;
   dibujarEntregado("Aula " + String(solicitud.aulaId));
   unsigned long tRetiro = millis();
   while (millis() - tRetiro < TIEMPO_RETIRO_MS) {
-    if (teclado.getKey()) break;           // cualquier tecla confirma el retiro
+    if (teclado.getKey()) break;
     delay(100);
   }
   notificarEvento("entregada", "llave retirada");

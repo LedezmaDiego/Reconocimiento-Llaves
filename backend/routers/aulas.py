@@ -1,6 +1,7 @@
 import re
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from config import (AULA_NOMBRE_MAX, AULA_UBICACION_MAX, PRESTAMO_TEXTO_MAX,
                     PRESTAMOS_HISTORIAL)
@@ -9,6 +10,7 @@ from db import (aulas, aula_por_id, crear_aula, actualizar_aula, registrar_prest
 from logs import log, obtener_hora
 from schemas import PedidoLlave, DevolucionLlave, AulaNueva, AulaEdicion
 from db import aula_por_rfid, asignar_rfid
+from pocketbase import uids_activos, listar_tags
 from seguridad import autenticar, autenticar_admin
 
 router = APIRouter()
@@ -36,12 +38,34 @@ def _texto(valor: str, campo: str, maximo: int) -> str:
     return limpio
 
 
+def _tags_por_aula() -> dict[str, list[dict]]:
+    """Tags de PocketBase agrupados por aula (una sola consulta). Si falla, devuelve vacío."""
+    try:
+        tags = listar_tags()
+    except Exception:
+        return {}
+    grupos: dict[str, list[dict]] = {}
+    for t in tags:
+        if t.get("llave_id"):
+            grupos.setdefault(str(t["llave_id"]), []).append(
+                {"id": t["id"], "nombre": t.get("nombre", ""), "uid": t.get("uid", ""),
+                 "tipo": t.get("tipo", "llave"), "activo": bool(t.get("activo")),
+                 "notas": t.get("notas", "")})
+    return grupos
+
+
+async def _aulas_con_estado() -> list[dict]:
+    ahora = obtener_hora()
+    grupos = await run_in_threadpool(_tags_por_aula)
+    return [{**a, "estado": _estado_aula(a, ahora), "tags": grupos.get(str(a["id"]), [])}
+            for a in aulas()]
+
+
 @router.get("/aulas", response_model=None)
 async def listar_aulas(request: Request) -> list[dict]:
-    """Lista las aulas con su estado y el préstamo activo, para el panel."""
+    """Lista las aulas con su estado, préstamo activo y tags, para el panel."""
     autenticar(request)
-    ahora = obtener_hora()
-    return [{**a, "estado": _estado_aula(a, ahora)} for a in aulas()]
+    return await _aulas_con_estado()
 
 
 @router.post("/aulas/pedir")
@@ -69,11 +93,12 @@ async def pedir_llave(datos: PedidoLlave, request: Request):
     prestamo = registrar_prestamo(datos.aula_id, profesor, actividad, hasta, usuario)
     log("LLAVE", f"{aula['nombre']}: retirada por {profesor} ({actividad}) hasta {datos.hasta}")
 
-    # Avisa al dispensador físico que debe ir a buscar esta llave.
-    # Si el aula no tiene tag RFID, se ignora: el préstamo igual queda registrado.
-    if aula["rfid"]:
+    # Avisa al dispensador físico. Entrega si el aula tiene algún tag activo
+    # (PocketBase) o el tag viejo de la columna rfid.
+    uids = await run_in_threadpool(uids_activos, aula["id"], aula["rfid"])
+    if uids:
         from routers.dispensador import _crear_solicitud
-        _crear_solicitud(aula, usuario, requiere_pin=False)
+        _crear_solicitud(aula, usuario, requiere_pin=False, uids=uids)
     else:
         log("DISPENSADOR", f"'{aula['nombre']}' sin tag RFID: el dispensador no la entregará")
 
@@ -105,11 +130,9 @@ async def devolver_llave(datos: DevolucionLlave, request: Request):
 
 @router.get("/admin/aulas", response_model=None)
 async def admin_aulas(request: Request) -> dict:
-    """Devuelve aulas, préstamos activos e historial para el panel de administración."""
+    """Devuelve aulas (con sus tags), préstamos activos e historial para el panel de administración."""
     autenticar_admin(request)
-    ahora = obtener_hora()
-    lista = [{**a, "estado": _estado_aula(a, ahora)} for a in aulas()]
-    return {"aulas": lista, "historial": historial_prestamos(PRESTAMOS_HISTORIAL)}
+    return {"aulas": await _aulas_con_estado(), "historial": historial_prestamos(PRESTAMOS_HISTORIAL)}
 
 
 @router.post("/admin/aulas")
@@ -143,14 +166,14 @@ async def admin_editar_aula(aula_id: int, datos: AulaEdicion, request: Request):
 
 @router.post("/admin/aulas/{aula_id}/rfid/{rfid}")
 async def admin_asignar_rfid(aula_id: int, rfid: str, request: Request):
-    """Asigna un tag RFID a un aula, rechazando tags ya usados por otra."""
+    """Asigna un tag RFID (columna legacy) a un aula, rechazando tags ya usados por otra."""
     autenticar_admin(request)
     rfid = (rfid or "").strip()
     if len(rfid) > 32:
         raise HTTPException(status_code=400, detail="El tag RFID es demasiado largo.")
     if not aula_por_id(aula_id):
         raise HTTPException(status_code=404, detail="Ese aula no existe.")
-    dueno = aula_por_rfid(rfid) if rfid else None
+    dueno = await run_in_threadpool(aula_por_rfid, rfid) if rfid else None
     if dueno and dueno["id"] != aula_id:
         raise HTTPException(status_code=409,
                             detail=f"Ese tag ya está asignado al aula '{dueno['nombre']}'.")
@@ -161,7 +184,7 @@ async def admin_asignar_rfid(aula_id: int, rfid: str, request: Request):
 
 @router.delete("/admin/aulas/{aula_id}/rfid")
 async def admin_quitar_rfid(aula_id: int, request: Request):
-    """Quita el tag RFID asignado a un aula."""
+    """Quita el tag RFID (columna legacy) asignado a un aula."""
     autenticar_admin(request)
     if not aula_por_id(aula_id):
         raise HTTPException(status_code=404, detail="Ese aula no existe.")

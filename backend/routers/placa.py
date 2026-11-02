@@ -12,6 +12,7 @@ from db import db, registrar_estado
 from estado import (ACCESO_CODIGO, LOGIN_ROSTRO, ULTIMA_AUTORIZACION, ULTIMA_FOTO,
                     ULTIMO_RESULTADO, SOLICITUD_LLAVE, modo_actual)
 from logs import log
+from pocketbase import guardar_foto
 from reconocimiento import comparar_rostro
 from schemas import EventoCasillero
 from seguridad import crear_sesion
@@ -97,6 +98,8 @@ async def reconocer_rostro(request: Request):
             ULTIMA_AUTORIZACION[casillero_id] = (res["persona"], time.time())
             ULTIMO_RESULTADO["texto"] = f"ACCESO PERMITIDO: {res['persona']} ({datetime.now().strftime('%H:%M:%S')})"
             log("ACCESO PERMITIDO", f"{res['persona']} (dist: {res['distancia']:.3f})")
+            await run_in_threadpool(guardar_foto, cuerpo, "reconocimiento",
+                                    res["persona"], True, res["distancia"])
             print("-" * 60)
             if aula_solicitada and res["persona"].lower() == SOLICITUD_LLAVE.get("persona", "").lower():
                 _registrar_acierto_rostro(aula_solicitada, res["persona"])
@@ -107,9 +110,11 @@ async def reconocer_rostro(request: Request):
         if res["rostro"]:
             log("ACCESO DENEGADO", f"Persona no registrada "
                   f"(más parecido: {res['mas_parecido']}, dist: {res['distancia']:.3f}, umbral: {UMBRAL})")
+            await run_in_threadpool(guardar_foto, cuerpo, "reconocimiento",
+                                    res.get("mas_parecido"), False, res["distancia"])
             motivo = "Persona no registrada."
         else:
-            log("SIN ROSTRO", f"No se detectó ninguna cara en la imagen")
+            log("SIN ROSTRO", "No se detectó ninguna cara en la imagen")
             motivo = "No se detectó ningún rostro."
         ULTIMO_RESULTADO["texto"] = f"Denegado: {motivo} ({datetime.now().strftime('%H:%M:%S')})"
         print("-" * 60)
@@ -121,8 +126,6 @@ async def reconocer_rostro(request: Request):
             if restantes <= 0:
                 SOLICITUD_LLAVE["requiere_pin"] = True
                 requiere_pin = True
-        else:
-            requiere_pin = False
 
         return {"status": "success", "modo": "reconocimiento", "autorizado": False,
                 "persona": "Desconocido", "mensaje": motivo,
@@ -158,5 +161,3 @@ async def listar_llaves() -> list[dict]:
     """Devuelve el estado de todos los casilleros registrados."""
     with closing(db()) as con:
         return [dict(r) for r in con.execute("SELECT * FROM llaves ORDER BY casillero_id")]
-
-
