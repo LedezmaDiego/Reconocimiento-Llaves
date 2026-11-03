@@ -1,734 +1,984 @@
-/*
- * ============================================================
- *  DISPENSADOR DE LLAVES - ESP32 (Arduino IDE)
- * ============================================================
- *  MOTOR (L298N puente B):   IN3 -> GPIO25   IN4 -> GPIO26
- *  ENCODER:                  GPIO34
- *  RFID RC522 (3.3V):        SS=5 SCK=18 MOSI=23 MISO=19 RST=27
- *  LCD I2C:                  SCL=22 SDA=21
- *  TECLADO 4x4:              R=4,13,14,16  C=17,32,33,2
- *  LED:                      R=12 G=15
- *
- *  Novedades:
- *   - Acepta varios tags por llave (campo "rfids" del servidor).
- *   - Modo escaneo: el admin pide escanear desde la web y el UID
- *     se envía al backend (MAYÚSCULAS, sin separadores).
- *   - Flujo por rostro: la ESP32-CAM reconoce a la persona, el LCD
- *     muestra "Bienvenido <persona>" y luego se escribe el número de
- *     aula. El servidor confirma si la llave está disponible antes de
- *     girar el carrusel.
- * ============================================================
- */
-
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <LiquidCrystal_I2C.h>
-#include <Keypad.h>
 #include <SPI.h>
 #include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Keypad.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// ===== RED =====
+
+// ===== RED (SERVER_URL = IP de la PC del backend: hostname -I) =====
 const char* WIFI_SSID      = "PEINE-3";
 const char* WIFI_PASSWORD  = "etecPeine3";
-const char* SERVER_URL     = "http://10.56.16.12:8000";   // IP de la PC del backend
+const char* SERVER_URL     = "http://10.56.16.134:8000";
 const char* DISPENSADOR_ID = "D01";
 
-// ===== PINES =====
-#define PIN_IN3      25
-#define PIN_IN4      26
-#define VEL_MOTOR   200
-#define PIN_ENCODER  34
-#define PIN_RFID_SS   5
-#define PIN_RFID_RST 27
-#define LCD_ADDR    0x27
-#define LCD_COLS    16
-#define LCD_ROWS     2
-const byte FILAS[4]    = { 4, 13, 14, 16};
-const byte COLUMNAS[4] = {17, 32, 33,  2};
-#define PIN_LED_R    12
-#define PIN_LED_G    15
+// true  = hay que mirar la cámara (rostro reconocido) antes de pedir el aula
+// false = se puede tipear el aula directo en el teclado
+const bool EXIGIR_ROSTRO = true;
 
-char teclas[4][4] = {
-  {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
+
+#define RFID_SS   5
+#define RFID_RST  27
+
+#define MOTOR_IN3 25
+#define MOTOR_IN4 26
+
+#define LED_VERDE 12
+#define LED_ROJO  15
+
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+MFRC522 rfid(RFID_SS, RFID_RST);
+
+
+const byte FILAS = 4;
+const byte COLUMNAS = 4;
+char teclas[FILAS][COLUMNAS] = {
+ {'1','2','3','A'},
+ {'4','5','6','B'},
+ {'7','8','9','C'},
+ {'*','0','#','D'}
 };
+byte pinesFilas[FILAS]       = {4, 13, 14, 16};
+byte pinesColumnas[COLUMNAS] = {17, 32, 33, 2};
+Keypad teclado = Keypad(makeKeymap(teclas), pinesFilas, pinesColumnas, FILAS, COLUMNAS);
 
-// ===== PARÁMETROS =====
-const unsigned long TIMEOUT_PETICION_MS   = 15000;
-const unsigned long TIMEOUT_SESION_MS     = 60000;
-const unsigned long TIMEOUT_GIRO_MS       = 10000;
-const unsigned long TIEMPO_RETIRO_MS      = 8000;
-const int           MAX_INTENTOS_PIN      = 3;
-const int           PULSOS_POR_VUELTA     = 20;   // CALIBRAR
+
+// ===== LLAVE PEDIDA (viene del servidor, no hay tabla fija) =====
+const int MAX_UIDS = 8;
+String uidsObjetivo[MAX_UIDS];
+int nUidsObjetivo = 0;
+String aulaPedida = "";        // nombre o número que se muestra en la LCD
+String personaActual = "";     // quien pidió la llave (rostro o web)
+bool origenWeb = false;        // true = pedido hecho desde la web
+int  aulaIdWeb = 0;
+bool requierePin = false;
+int  intentosPin = 0;
+const int MAX_INTENTOS_PIN = 3;
+
+// Llaves que salieron de la rueda (por UID) para el LED rojo
+const int MAX_FALTANTES = 30;
+String faltantes[MAX_FALTANTES];
+int nFaltantes = 0;
+
+
+enum EstadoSistema {
+ REPOSO,
+ ESPERANDO_AULA,
+ ESPERANDO_PIN,
+ BUSCANDO_LLAVE,
+ BUSCANDO_VACIO,        // vuelta completa sin encontrar: avanza hasta un hueco sin llavero
+ LLAVE_NO_ENCONTRADA,
+ LLAVE_ENCONTRADA,
+ DEVOLUCION_DETECTADA,
+ LIMPIANDO_POSICION
+};
+EstadoSistema estado = REPOSO;
+
+
+String bufferAula = "";
+String bufferPin  = "";
+bool motorPulsando = false;
+unsigned long inicioPulso = 0;
+const unsigned long DURACION_PASO_MS  = 500;   // AJUSTAR porque no usamos el encoder
+const unsigned long TIEMPO_GRACIA_MS  = 5000;  // motor quieto para agarrar la llave
+const unsigned long TIEMPO_MENSAJE_MS = 3000;
+const unsigned long TIMEOUT_SESION_MS = 60000;
+const unsigned long SALUDO_MS         = 2500;
+const unsigned long AVISO_MS          = 2500;
+unsigned long inicioGracia = 0;
+unsigned long inicioSesionMs = 0;
+bool lcdSucio = true;
+
+const int LONGITUD_LCD = 16;
+
+
+// ===== Consultas periódicas al servidor =====
 const unsigned long CONSULTA_SOLICITUD_MS = 3000;
-const unsigned long CONSULTA_ESCANEO_MS   = 1000;
-const int           MAX_TAGS              = 8;
-// Flujo por rostro: el ESP32-CAM reconoce y el dispensador saluda y pide el aula.
 const unsigned long CONSULTA_ROSTRO_MS    = 1500;
-const unsigned long SALUDO_MS             = 2500;
-const unsigned long AVISO_MS              = 2500;
-const int           LONGITUD_LCD          = 16;
-
-// ===== ESTRUCTURAS =====
-struct SolicitudLlave {
-  bool   activa      = false;
-  int    aulaId      = 0;
-  String aulaNombre  = "";
-  String persona     = "";
-  String rfids[MAX_TAGS];
-  int    nRfids      = 0;
-  bool   requierePin = false;
-};
-
-struct EstadoDispensador {
-  bool motorGirando = false;
-  volatile long pulsosEncoder = 0;
-  int  intentosPin  = 0;
-};
-
-LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
-Keypad teclado = Keypad(makeKeymap(teclas), FILAS, COLUMNAS, 4, 4);
-MFRC522 rfid(PIN_RFID_SS, PIN_RFID_RST);
-
-SolicitudLlave    solicitud;
-EstadoDispensador estado;
-
+const unsigned long CONSULTA_ESCANEO_MS   = 1000;
 unsigned long ultimaPeticionMs         = 0;
-unsigned long ultimaConsultaEscaneoMs  = 0;
 unsigned long ultimaConsultaRostroMs   = 0;
-unsigned long ultimaAccionMs           = 0;
+unsigned long ultimaConsultaEscaneoMs  = 0;
 bool modoEscaneo = false;
+long ultimoSeqSaludado = -1;
 
-// Rostro que avisó el ESP32-CAM. "ultimoSeqSaludado" evita repetir el saludo.
-String personaReconocida = "";
-long   ultimoSeqSaludado = -1;
 
-String bufferAula, bufferPin;
-int pantalla = 0;   // 0 inicio, 1 aula, 2 PIN, 3 girando, 4 entregado, 5 error
+// UID del último llavero leído (copia propia, porque rfid.uid se pisa al hacer Halt)
+byte uidActual[4] = {0, 0, 0, 0};
+
+
+// ---- Referencia para detectar vuelta completa ----
+byte uidReferencia[4] = {0, 0, 0, 0};
+bool tieneReferencia = false;
+bool referenciaAbandonada = false;   // la referencia ya salió del lector al menos una vez
+int  pulsosBusqueda = 0;
+const int MAX_PULSOS_BUSQUEDA = 80;  // seguridad: si no hay ningún llavero, no gira para siempre
+const int MAX_PULSOS_VACIO    = 40;  // seguridad: si no hay ningún hueco, se detiene igual
+
 
 // ===== PROTOTIPOS =====
+String recortarLCD(const String& texto);
+void mostrarLCD(String l1, String l2 = "");
+void iniciarPulsoMotor();
+void detenerMotor();
+bool pulsoTerminado();
+void actualizarLed();
+void marcarFaltante(const String& uid);
+void quitarFaltante(const String& uid);
+bool hayTarjetaPresente();
+bool uidCoincide(byte* a, byte* b);
+String uidAString(byte* u);
+bool esLlaveObjetivo();
+void reiniciarBusqueda();
+void iniciarBusqueda();
+void volverAInicio();
+void cancelarPorUsuario();
 void setupWiFi();
 void mantenerWiFi();
-void mostrarEnLCD(const String& l1, const String& l2 = "");
-void ledRojo(); void ledVerde(); void ledAzul(); void ledAmbar(); void ledApagado();
-void IRAM_ATTR encoderISR();
-void girarMotor(int velocidad);
-void detenerMotor();
-String leerRFID();
-bool buscarYLlevarLlave();
+String peticionHTTP(const String& endpoint, const String& cuerpo, int timeoutMs);
+void notificarEvento(const String& evento, const String& detalle = "", const String& uid = "");
 bool peticionSolicitud();
+void iniciarSolicitudWeb();
 bool validarPinEnServidor(const String& pin);
-bool notificarEvento(const String& evento, const String& detalle = "");
-String peticionHTTP(const String& endpoint, const String& metodo,
-                    const String& cuerpo, const String& tipoContenido);
-bool esTagObjetivo(const String& uid);
-void gestionarEscaneo();
-void dibujarInicio(); void dibujarAula(); void dibujarPin(); void dibujarGirando();
-void dibujarEntregado(const String& aula); void dibujarError(const String& mensaje);
-void procesarTecla(char tecla);
-void resetSesion();
-// Flujo por rostro
-String recortarLCD(const String& texto);
-void avisar(const String& l1, const String& l2);
+void consultarRostro();
 void saludar(const String& persona);
-bool consultarRostro();
-bool solicitarLlave(const String& numero);
+void avisar(const String& l1, const String& l2);
+void solicitarLlave(const String& numero);
+void procesarTeclaAula(char tecla);
+void consultarRed();
+void procesarEscaneo();
+void dibujarReposo();
 
-// ===== SETUP =====
-void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("\n\n=== DISPENSADOR DE LLAVES ===");
 
-  pinMode(PIN_IN3, OUTPUT);
-  pinMode(PIN_IN4, OUTPUT);
-  detenerMotor();
-
-  pinMode(PIN_ENCODER, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_ENCODER), encoderISR, RISING);
-
-  pinMode(PIN_LED_R, OUTPUT);
-  pinMode(PIN_LED_G, OUTPUT);
-  ledApagado();
-
-  lcd.init();
-  lcd.backlight();
-  mostrarEnLCD("Iniciando...", "Dispensador ETEC");
-
-  SPI.begin();
-  rfid.PCD_Init();
-  Serial.println("RC522 listo");
-
-  setupWiFi();
-  pantalla = 0;
-  dibujarInicio();
-  Serial.println("Sistema listo.");
+// ============================================================
+//  LCD
+// ============================================================
+String recortarLCD(const String& texto) {
+ return texto.length() <= LONGITUD_LCD ? texto : texto.substring(0, LONGITUD_LCD);
 }
 
-// ===== LOOP =====
-void loop() {
-  mantenerWiFi();
-
-  // En reposo se consulta la web (solicitud) y la cámara (rostro reconocido).
-  if (WiFi.status() == WL_CONNECTED && pantalla == 0) {
-    if (millis() - ultimaPeticionMs > CONSULTA_SOLICITUD_MS) {
-      ultimaPeticionMs = millis();
-      peticionSolicitud();
-    }
-    // Si hay un pedido hecho desde la web, ese tiene prioridad sobre el rostro.
-    if (!solicitud.activa && !modoEscaneo &&
-        millis() - ultimaConsultaRostroMs > CONSULTA_ROSTRO_MS) {
-      ultimaConsultaRostroMs = millis();
-      consultarRostro();
-    }
-    gestionarEscaneo();
-  }
-
-  char tecla = teclado.getKey();
-  if (tecla) {
-    procesarTecla(tecla);
-    ultimaAccionMs = millis();
-  }
-
-  if (pantalla != 0 && millis() - ultimaAccionMs > TIMEOUT_SESION_MS) {
-    resetSesion();
-  }
-
-  delay(50);
+void mostrarLCD(String l1, String l2) {
+ lcd.clear();
+ lcd.setCursor(0, 0);
+ lcd.print(recortarLCD(l1));
+ lcd.setCursor(0, 1);
+ lcd.print(recortarLCD(l2));
 }
 
-// ===== WIFI =====
-void setupWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  mostrarEnLCD("Conectando WiFi", WIFI_SSID);
-
-  int intentos = 0;
-  while (WiFi.status() != WL_CONNECTED && intentos < 40) {
-    delay(500);
-    Serial.print(".");
-    intentos++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
-    mostrarEnLCD("WiFi OK", WiFi.localIP().toString());
-  } else {
-    Serial.println("\nWiFi FALLO - reiniciando");
-    mostrarEnLCD("WiFi ERROR", "Reiniciando...");
-    delay(2000);
-    ESP.restart();
-  }
-  delay(1000);
+void dibujarReposo() {
+ if (modoEscaneo)         mostrarLCD("Escaneo de tag", "Apoye el llavero");
+ else if (EXIGIR_ROSTRO)  mostrarLCD("Llavero ETEC", "Mire la camara");
+ else                     mostrarLCD("Ingrese aula:", "");
 }
 
-void mantenerWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  static unsigned long ultimoIntento = 0;
-  if (millis() - ultimoIntento < 5000) return;
-  ultimoIntento = millis();
-  Serial.println("WiFi caido. Reconectando...");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-}
 
-// ===== LCD =====
-void mostrarEnLCD(const String& l1, const String& l2) {
-  lcd.clear();
-  lcd.setCursor(0, 0);
-  lcd.print(l1);
-  if (l2.length() > 0) {
-    lcd.setCursor(0, 1);
-    lcd.print(l2);
-  }
-}
-
-// ===== LED (ánodo común: HIGH apaga, LOW enciende) =====
-void ledRojo()   { digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, LOW);  }
-void ledVerde()  { digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, HIGH); }
-void ledAmbar()  { digitalWrite(PIN_LED_R, HIGH); digitalWrite(PIN_LED_G, HIGH); }
-void ledAzul()   { digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, LOW);  }
-void ledApagado(){ digitalWrite(PIN_LED_R, LOW);  digitalWrite(PIN_LED_G, LOW);  }
-
-// ===== ENCODER + MOTOR =====
-void IRAM_ATTR encoderISR() {
-  estado.pulsosEncoder++;
-}
-
-void girarMotor(int velocidad) {
-  analogWrite(PIN_IN3, velocidad);
-  digitalWrite(PIN_IN4, LOW);
-  estado.motorGirando = true;
+// ============================================================
+//  MOTOR (por pulsos, sin encoder)
+// ============================================================
+void iniciarPulsoMotor() {
+ digitalWrite(MOTOR_IN3, HIGH);
+ digitalWrite(MOTOR_IN4, LOW);
+ motorPulsando = true;
+ inicioPulso = millis();
 }
 
 void detenerMotor() {
-  analogWrite(PIN_IN3, 0);
-  digitalWrite(PIN_IN4, LOW);
-  estado.motorGirando = false;
+ digitalWrite(MOTOR_IN3, LOW);
+ digitalWrite(MOTOR_IN4, LOW);
+ motorPulsando = false;
 }
 
-// ===== RFID: UID en MAYÚSCULAS, sin separadores (ej. 04A32B1F) =====
-String leerRFID() {
-  if (!rfid.PICC_IsNewCardPresent()) return "";
-  if (!rfid.PICC_ReadCardSerial())   return "";
-
-  String uid = "";
-  for (byte i = 0; i < rfid.uid.size; i++) {
-    if (rfid.uid.uidByte[i] < 0x10) uid += "0";
-    uid += String(rfid.uid.uidByte[i], HEX);
-  }
-  uid.toUpperCase();
-  rfid.PICC_HaltA();
-  return uid;
+bool pulsoTerminado() {
+ return motorPulsando && (millis() - inicioPulso >= DURACION_PASO_MS);
 }
 
-bool esTagObjetivo(const String& uid) {
-  for (int i = 0; i < solicitud.nRfids; i++) {
-    if (uid.equalsIgnoreCase(solicitud.rfids[i])) return true;
-  }
-  return false;
+
+// ============================================================
+//  LED
+// ============================================================
+void actualizarLed() {
+ digitalWrite(LED_VERDE, HIGH);
+ digitalWrite(LED_ROJO, nFaltantes > 0 ? HIGH : LOW);
 }
 
-// ===== HTTP =====
-String peticionHTTP(const String& endpoint, const String& metodo,
-                    const String& cuerpo, const String& tipoContenido) {
-  if (WiFi.status() != WL_CONNECTED) return "";
-
-  HTTPClient http;
-  http.begin(String(SERVER_URL) + endpoint);
-  http.setTimeout(TIMEOUT_PETICION_MS);
-  if (cuerpo.length() > 0) http.addHeader("Content-Type", tipoContenido);
-  http.addHeader("X-Dispensador-Id", DISPENSADOR_ID);
-
-  int codigo = (metodo == "GET") ? http.GET() : http.POST(cuerpo);
-
-  String respuesta = "";
-  if (codigo > 0) {
-    respuesta = http.getString();
-  } else {
-    Serial.printf("HTTP %d: %s\n", codigo, http.errorToString(codigo).c_str());
-  }
-  http.end();
-  return respuesta;
+void marcarFaltante(const String& uid) {
+ for (int i = 0; i < nFaltantes; i++) if (faltantes[i] == uid) return;
+ if (nFaltantes < MAX_FALTANTES) faltantes[nFaltantes++] = uid;
+ actualizarLed();
 }
 
+void quitarFaltante(const String& uid) {
+ for (int i = 0; i < nFaltantes; i++) {
+   if (faltantes[i] == uid) {
+     faltantes[i] = faltantes[nFaltantes - 1];
+     nFaltantes--;
+     break;
+   }
+ }
+ actualizarLed();
+}
+
+
+// ============================================================
+//  RFID
+// ============================================================
+// Lee un llavero y guarda su UID en uidActual. Lo "duerme" (Halt) para que
+// al volver a pasar por el lector se detecte como tarjeta nueva.
+bool hayTarjetaPresente() {
+ if (!rfid.PICC_IsNewCardPresent()) return false;
+ if (!rfid.PICC_ReadCardSerial())   return false;
+ for (int i = 0; i < 4; i++) uidActual[i] = rfid.uid.uidByte[i];
+ rfid.PICC_HaltA();
+ rfid.PCD_StopCrypto1();
+ return true;
+}
+
+bool uidCoincide(byte* uidLeido, byte* uidObjetivo) {
+ for (int i = 0; i < 4; i++) {
+   if (uidLeido[i] != uidObjetivo[i]) return false;
+ }
+ return true;
+}
+
+// UID en MAYÚSCULAS sin separadores (ej. CAA8EA81), igual que el servidor
+String uidAString(byte* u) {
+ String s = "";
+ for (int i = 0; i < 4; i++) {
+   if (u[i] < 0x10) s += "0";
+   s += String(u[i], HEX);
+ }
+ s.toUpperCase();
+ return s;
+}
+
+// ¿El llavero leído es uno de los que devolvió el servidor?
+bool esLlaveObjetivo() {
+ String uid = uidAString(uidActual);
+ for (int i = 0; i < nUidsObjetivo; i++) {
+   if (uid.equalsIgnoreCase(uidsObjetivo[i])) return true;
+ }
+ return false;
+}
+
+
+// ============================================================
+//  BÚSQUEDA / SESIÓN
+// ============================================================
+void reiniciarBusqueda() {
+ tieneReferencia = false;
+ referenciaAbandonada = false;
+ pulsosBusqueda = 0;
+}
+
+void iniciarBusqueda() {
+ reiniciarBusqueda();
+ estado = BUSCANDO_LLAVE;
+ lcdSucio = true;
+ iniciarPulsoMotor();
+}
+
+void volverAInicio() {
+ detenerMotor();
+ reiniciarBusqueda();
+ bufferAula = "";
+ bufferPin = "";
+ origenWeb = false;
+ personaActual = "";
+ aulaIdWeb = 0;
+ requierePin = false;
+ intentosPin = 0;
+ estado = REPOSO;
+ lcdSucio = true;
+ ultimaPeticionMs = millis();
+ ultimaConsultaRostroMs = millis();
+}
+
+// Tecla D: frena el motor y cancela lo que se esté haciendo
+void cancelarPorUsuario() {
+ detenerMotor();
+ notificarEvento("error", "cancelado por el usuario");
+ mostrarLCD("Cancelado", "");
+ delay(1000);
+ volverAInicio();
+}
+
+
+// ============================================================
+//  WIFI Y HTTP
+// ============================================================
+void setupWiFi() {
+ WiFi.mode(WIFI_STA);
+ WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+ mostrarLCD("Conectando WiFi", WIFI_SSID);
+
+ int intentos = 0;
+ while (WiFi.status() != WL_CONNECTED && intentos < 40) {
+   delay(500);
+   Serial.print(".");
+   intentos++;
+ }
+
+ if (WiFi.status() == WL_CONNECTED) {
+   Serial.println("\nWiFi OK: " + WiFi.localIP().toString());
+   mostrarLCD("WiFi OK", WiFi.localIP().toString());
+ } else {
+   Serial.println("\nWiFi FALLO");
+   mostrarLCD("Sin WiFi", "Reintentando...");
+ }
+ delay(1500);
+}
+
+void mantenerWiFi() {
+ if (WiFi.status() == WL_CONNECTED) return;
+ static unsigned long ultimoIntento = 0;
+ if (millis() - ultimoIntento < 10000) return;
+ ultimoIntento = millis();
+ WiFi.disconnect();
+ WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+// Petición HTTP simple: GET si no hay cuerpo, POST si lo hay. Devuelve el cuerpo, o "" si falla.
+String peticionHTTP(const String& endpoint, const String& cuerpo, int timeoutMs) {
+ if (WiFi.status() != WL_CONNECTED) return "";
+
+ HTTPClient http;
+ http.begin(String(SERVER_URL) + endpoint);
+ http.setConnectTimeout(timeoutMs);
+ http.setTimeout(timeoutMs);
+ http.addHeader("X-Dispensador-Id", DISPENSADOR_ID);
+
+ int codigo;
+ if (cuerpo.length() > 0) {
+   http.addHeader("Content-Type", "application/json");
+   codigo = http.POST(cuerpo);
+ } else {
+   codigo = http.GET();
+ }
+
+ String respuesta = "";
+ if (codigo > 0) {
+   respuesta = http.getString();
+ } else {
+   Serial.printf("HTTP %d: %s\n", codigo, http.errorToString(codigo).c_str());
+ }
+ http.end();
+ return respuesta;
+}
+
+// Avisa un evento al servidor. Pedidos de la web -> /dispensador/confirmar,
+// pedidos por rostro/teclado -> /dispensador/llave/evento. No frena nada si falla.
+void notificarEvento(const String& evento, const String& detalle, const String& uid) {
+ StaticJsonDocument<320> doc;
+ String cuerpo;
+ String ruta;
+
+ if (origenWeb) {
+   doc["evento"]  = evento;
+   doc["aula_id"] = aulaIdWeb;
+   doc["persona"] = personaActual;
+   doc["rfid"]    = nUidsObjetivo > 0 ? uidsObjetivo[0] : "";
+   doc["detalle"] = detalle;
+   ruta = "/dispensador/confirmar";
+ } else {
+   doc["numero_aula"] = aulaPedida;
+   doc["evento"]      = evento;
+   doc["persona"]     = personaActual;
+   doc["uid"]         = uid;
+   doc["detalle"]     = detalle;
+   ruta = "/dispensador/llave/evento";
+ }
+ serializeJson(doc, cuerpo);
+ peticionHTTP(ruta, cuerpo, 1500);
+}
+
+
+// ============================================================
+//  PEDIDO DESDE LA WEB (solicitud activa en el servidor)
+// ============================================================
 bool peticionSolicitud() {
-  String json = peticionHTTP("/dispensador/solicitud", "GET", "", "");
-  if (json.isEmpty()) return false;
+ String json = peticionHTTP("/dispensador/solicitud", "", 2000);
+ if (json.isEmpty()) return false;
 
-  StaticJsonDocument<768> doc;
-  if (deserializeJson(doc, json)) {
-    Serial.println("JSON inválido del servidor");
-    return false;
-  }
+ StaticJsonDocument<768> doc;
+ if (deserializeJson(doc, json)) return false;
+ if (!(doc["activa"] | false)) return false;
 
-  if (!(doc["activa"] | false)) {
-    if (solicitud.activa && pantalla == 0) resetSesion();
-    solicitud.activa = false;
-    return false;
-  }
+ aulaIdWeb     = doc["aula_id"] | 0;
+ aulaPedida    = doc["aula_nombre"].as<String>();
+ personaActual = doc["persona"].as<String>();
+ requierePin   = doc["requiere_pin"] | false;
 
-  solicitud.activa      = true;
-  solicitud.aulaId      = doc["aula_id"] | 0;
-  solicitud.aulaNombre  = doc["aula_nombre"].as<String>();
-  solicitud.persona     = doc["persona"].as<String>();
-  solicitud.requierePin = doc["requiere_pin"] | false;
+ nUidsObjetivo = 0;
+ JsonArray lista = doc["rfids"].as<JsonArray>();
+ if (!lista.isNull()) {
+   for (JsonVariant v : lista) {
+     if (nUidsObjetivo >= MAX_UIDS) break;
+     uidsObjetivo[nUidsObjetivo++] = v.as<String>();
+   }
+ }
+ if (nUidsObjetivo == 0) {
+   String unico = doc["rfid"].as<String>();
+   if (unico.length() > 0) uidsObjetivo[nUidsObjetivo++] = unico;
+ }
 
-  // Lista de tags válidos; si el servidor viejo no la manda, usa "rfid".
-  solicitud.nRfids = 0;
-  JsonArray lista = doc["rfids"].as<JsonArray>();
-  if (!lista.isNull()) {
-    for (JsonVariant v : lista) {
-      if (solicitud.nRfids >= MAX_TAGS) break;
-      solicitud.rfids[solicitud.nRfids++] = v.as<String>();
-    }
-  }
-  if (solicitud.nRfids == 0) {
-    String unico = doc["rfid"].as<String>();
-    if (unico.length() > 0) solicitud.rfids[solicitud.nRfids++] = unico;
-  }
+ Serial.printf("Solicitud web: aula=%d (%s) tags=%d pin=%s\n",
+               aulaIdWeb, aulaPedida.c_str(), nUidsObjetivo, requierePin ? "SI" : "NO");
+ return true;
+}
 
-  Serial.printf("Solicitud: aula=%d (%s) tags=%d pin=%s\n",
-                solicitud.aulaId, solicitud.aulaNombre.c_str(),
-                solicitud.nRfids, solicitud.requierePin ? "SI" : "NO");
-  return true;
+void iniciarSolicitudWeb() {
+ origenWeb = true;
+ intentosPin = 0;
+ bufferPin = "";
+
+ if (nUidsObjetivo == 0) {
+   notificarEvento("error", "el aula no tiene tag RFID");
+   mostrarLCD("Llave sin tag", aulaPedida);
+   delay(2000);
+   volverAInicio();
+   return;
+ }
+
+ if (requierePin) {
+   inicioSesionMs = millis();
+   estado = ESPERANDO_PIN;
+   lcdSucio = true;
+ } else {
+   iniciarBusqueda();
+ }
 }
 
 bool validarPinEnServidor(const String& pin) {
-  if (solicitud.persona.isEmpty()) {
-    Serial.println("PIN: no hay persona en la solicitud");
-    return false;
-  }
-  StaticJsonDocument<160> doc;
-  doc["aula_id"] = solicitud.aulaId;
-  doc["pin"]     = pin;
-  doc["persona"] = solicitud.persona;
-  String cuerpo;
-  serializeJson(doc, cuerpo);
+ if (personaActual.isEmpty()) return false;
+ StaticJsonDocument<160> doc;
+ doc["aula_id"] = aulaIdWeb;
+ doc["pin"]     = pin;
+ doc["persona"] = personaActual;
+ String cuerpo;
+ serializeJson(doc, cuerpo);
 
-  String resp = peticionHTTP("/dispensador/pin", "POST", cuerpo, "application/json");
-  return resp.indexOf("\"ok\":true") >= 0;
+ String resp = peticionHTTP("/dispensador/pin", cuerpo, 4000);
+ return resp.indexOf("\"ok\":true") >= 0;
 }
 
-bool notificarEvento(const String& evento, const String& detalle) {
-  StaticJsonDocument<256> doc;
-  doc["evento"]  = evento;
-  doc["aula_id"] = solicitud.aulaId;
-  doc["persona"] = solicitud.persona;
-  doc["rfid"]    = solicitud.nRfids > 0 ? solicitud.rfids[0] : "";
-  doc["detalle"] = detalle;
-  String cuerpo;
-  serializeJson(doc, cuerpo);
-  return peticionHTTP("/dispensador/confirmar", "POST", cuerpo,
-                      "application/json").length() > 0;
-}
 
-// ===== MODO ESCANEO (alta de tags desde la web) =====
-void gestionarEscaneo() {
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  if (millis() - ultimaConsultaEscaneoMs > CONSULTA_ESCANEO_MS) {
-    ultimaConsultaEscaneoMs = millis();
-    String r = peticionHTTP("/dispensador/modo-escaneo", "GET", "", "");
-    bool activo = r.indexOf("\"activo\":true") >= 0;
-    if (activo && !modoEscaneo) {
-      mostrarEnLCD("Escaneo de tag", "Apoye la tarjeta");
-      ledAmbar();
-    } else if (!activo && modoEscaneo) {
-      dibujarInicio();
-    }
-    modoEscaneo = activo;
-  }
-
-  if (!modoEscaneo) return;
-
-  String uid = leerRFID();
-  if (uid.isEmpty()) return;
-
-  Serial.println("UID escaneado: " + uid);
-  StaticJsonDocument<96> doc;
-  doc["uid"] = uid;
-  String cuerpo;
-  serializeJson(doc, cuerpo);
-  String resp = peticionHTTP("/dispensador/escaneo", "POST", cuerpo, "application/json");
-
-  if (resp.indexOf("\"ok\":true") >= 0) {
-    mostrarEnLCD("Tag leido", uid);
-    ledVerde();
-  } else {
-    mostrarEnLCD("Escaneo fallido", "Reintente");
-    ledRojo();
-  }
-  modoEscaneo = false;
-  delay(2000);
-  dibujarInicio();
-}
-
-// ===== FLUJO POR ROSTRO =====
+// ============================================================
+//  FLUJO POR ROSTRO + PEDIDO POR TECLADO
+// ============================================================
 // El ESP32-CAM manda cada rostro autorizado al servidor; acá se consulta cuál
 // fue el último y se saluda. Después la persona escribe el número de aula.
-String recortarLCD(const String& texto) {
-  return texto.length() <= LONGITUD_LCD ? texto : texto.substring(0, LONGITUD_LCD);
-}
+void consultarRostro() {
+ String json = peticionHTTP("/dispensador/reconocido", "", 1500);
+ if (json.isEmpty()) return;
 
-void avisar(const String& l1, const String& l2) {
-  mostrarEnLCD(recortarLCD(l1), recortarLCD(l2));
-  ledRojo();
-  delay(AVISO_MS);
-  if (personaReconocida.length() > 0) {
-    bufferAula = "";
-    pantalla = 1;
-    dibujarAula();
-  } else {
-    resetSesion();
-  }
-  ultimaAccionMs = millis();
+ StaticJsonDocument<256> doc;
+ if (deserializeJson(doc, json)) return;
+ if (!(doc["reconocido"] | false)) return;
+
+ String persona = doc["persona"].as<String>();
+ long seq = doc["seq"] | 0;
+ if (persona.isEmpty()) return;
+ if (seq == ultimoSeqSaludado) return;     // ya se saludó por este aviso
+
+ ultimoSeqSaludado = seq;
+ saludar(persona);
 }
 
 void saludar(const String& persona) {
-  Serial.println("Rostro reconocido: " + persona);
-  personaReconocida = persona;
-  mostrarEnLCD("Bienvenido", recortarLCD(persona));
-  ledVerde();
-  delay(SALUDO_MS);
-  bufferAula = "";
-  bufferPin = "";
-  estado.intentosPin = 0;
-  pantalla = 1;
-  dibujarAula();
-  ultimaAccionMs = millis();
+ Serial.println("Rostro reconocido: " + persona);
+ personaActual = persona;
+ origenWeb = false;
+ mostrarLCD("Bienvenido", persona);
+ delay(SALUDO_MS);
+ bufferAula = "";
+ estado = ESPERANDO_AULA;
+ inicioSesionMs = millis();
+ lcdSucio = true;
 }
 
-bool consultarRostro() {
-  String json = peticionHTTP("/dispensador/reconocido", "GET", "", "");
-  if (json.isEmpty()) return false;
-
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, json)) return false;
-  if (!(doc["reconocido"] | false)) return false;
-
-  String persona = doc["persona"].as<String>();
-  long seq = doc["seq"] | 0;
-  if (persona.isEmpty()) return false;
-  // Misma persona y mismo aviso: no repetir el saludo.
-  if (seq == ultimoSeqSaludado && persona.equalsIgnoreCase(personaReconocida)) return false;
-
-  ultimoSeqSaludado = seq;
-  saludar(persona);
-  return true;
+// Muestra un mensaje y vuelve a pedir el aula (si hay persona) o al reposo.
+void avisar(const String& l1, const String& l2) {
+ mostrarLCD(l1, l2);
+ delay(AVISO_MS);
+ bufferAula = "";
+ if (personaActual.length() > 0) {
+   estado = ESPERANDO_AULA;
+   inicioSesionMs = millis();
+   lcdSucio = true;
+ } else {
+   volverAInicio();
+ }
 }
 
-bool solicitarLlave(const String& numero) {
-  String json = peticionHTTP("/dispensador/llave/" + numero, "GET", "", "");
-  if (json.isEmpty()) {
-    avisar("Sin conexion", "Reintente");
-    return false;
-  }
+// Le pregunta al servidor qué UID(s) tiene el aula y si la llave está disponible.
+void solicitarLlave(const String& numero) {
+ mostrarLCD("Consultando...", "Aula " + numero);
 
-  DynamicJsonDocument doc(1024);
-  if (deserializeJson(doc, json)) {
-    avisar("Error", "Respuesta invalida");
-    return false;
-  }
+ String json = peticionHTTP("/dispensador/llave/" + numero, "", 4000);
+ if (json.isEmpty()) {
+   avisar("Sin conexion", "con el servidor");
+   return;
+ }
 
-  // El servidor consulta la base: aula existente, activa y llave no prestada.
-  if (!(doc["ok"] | false)) {
-    avisar("No disponible", doc["error"] | "Aula invalida");
-    return false;
-  }
-  if (!(doc["disponible"] | false)) {
-    avisar("Llave no", "disponible");
-    return false;
-  }
+ StaticJsonDocument<768> doc;
+ if (deserializeJson(doc, json)) {
+   avisar("Error servidor", "Respuesta invalida");
+   return;
+ }
 
-  JsonArray lista = doc["uids"].as<JsonArray>();
-  if (lista.isNull() || lista.size() == 0) {
-    avisar("Llave sin tag", "Avisa al admin");
-    return false;
-  }
+ if (!(doc["ok"] | false)) {
+   String error = doc["error"].as<String>();
+   if (error.indexOf("no tiene") >= 0) avisar("Aula sin llavero", "Aula " + numero);
+   else avisar("No disponible", error.length() > 0 ? error : String("Aula invalida"));
+   return;
+ }
 
-  solicitud = SolicitudLlave();
-  solicitud.activa      = true;
-  solicitud.aulaId      = doc["aula_id"] | numero.toInt();
-  solicitud.aulaNombre  = doc["aula_nombre"].as<String>();
-  solicitud.persona     = personaReconocida;
-  solicitud.requierePin = false;
-  for (JsonVariant v : lista) {
-    if (solicitud.nRfids >= MAX_TAGS) break;
-    solicitud.rfids[solicitud.nRfids++] = v.as<String>();
-  }
+ // Si el servidor manda "disponible" en false, la llave ya está prestada.
+ if (!(doc["disponible"] | true)) {
+   avisar("Llave no", "disponible");
+   return;
+ }
 
-  Serial.printf("Llave pedida: aula=%d (%s) tags=%d persona=%s\n",
-                solicitud.aulaId, solicitud.aulaNombre.c_str(),
-                solicitud.nRfids, solicitud.persona.c_str());
-  pantalla = 3;
-  dibujarGirando();
-  buscarYLlevarLlave();
-  return true;
+ nUidsObjetivo = 0;
+ JsonArray lista = doc["uids"].as<JsonArray>();
+ if (!lista.isNull()) {
+   for (JsonVariant v : lista) {
+     if (nUidsObjetivo >= MAX_UIDS) break;
+     uidsObjetivo[nUidsObjetivo++] = v.as<String>();
+   }
+ }
+ if (nUidsObjetivo == 0) {
+   avisar("Llave sin tag", "Avisa al admin");
+   return;
+ }
+
+ String nombre = doc["aula_nombre"].as<String>();
+ aulaPedida = (nombre.length() > 0 && nombre != "null") ? nombre : numero;
+ origenWeb = false;
+ aulaIdWeb = 0;
+ bufferAula = "";
+
+ Serial.printf("Llave pedida: aula=%s tags=%d persona=%s\n",
+               aulaPedida.c_str(), nUidsObjetivo, personaActual.c_str());
+ iniciarBusqueda();
 }
 
-// ===== PANTALLAS =====
-void dibujarInicio() {
-  mostrarEnLCD("Llavero ETEC", "Mire la camara");
-  ledAzul();
-}
-void dibujarAula() { mostrarEnLCD("Nro de aula", "Aula:" + bufferAula + "  #"); }
-void dibujarPin() {
-  String oculto(bufferPin.length(), '*');
-  mostrarEnLCD("Ingrese PIN:", oculto + " #");
-}
-void dibujarGirando() {
-  mostrarEnLCD("Buscando llave", recortarLCD(solicitud.aulaNombre));
-  ledAmbar();
-}
-void dibujarEntregado(const String& aula) {
-  mostrarEnLCD("Retire su llave", aula);
-  ledVerde();
-}
-void dibujarError(const String& mensaje) {
-  mostrarEnLCD("ERROR", mensaje);
-  ledRojo();
+void procesarTeclaAula(char tecla) {
+ if (tecla >= '0' && tecla <= '9') {
+   if (bufferAula.length() < 3) bufferAula += tecla;
+   lcdSucio = true;
+   if (bufferAula.length() == 3) {
+     String numero = bufferAula;
+     solicitarLlave(numero);
+   }
+ } else if (tecla == '#') {
+   if (bufferAula.length() > 0) {
+     String numero = bufferAula;
+     solicitarLlave(numero);
+   }
+ } else if (tecla == '*') {
+   bufferAula = "";
+   lcdSucio = true;
+ } else if (tecla == 'D') {
+   volverAInicio();
+ }
 }
 
-// ===== TECLADO =====
-void procesarTecla(char tecla) {
-  Serial.printf("Tecla '%c' (pantalla %d)\n", tecla, pantalla);
 
-  switch (pantalla) {
-    case 0:
-      if (peticionSolicitud() && solicitud.activa) {
-        bufferAula = ""; bufferPin = "";
-        estado.intentosPin = 0;
-        pantalla = solicitud.requierePin ? 2 : 1;
-        (solicitud.requierePin ? dibujarPin() : dibujarAula());
-      } else {
-        mostrarEnLCD("Sin solicitudes", "Espere...");
-        delay(1000);
-        dibujarInicio();
-      }
-      break;
+// ============================================================
+//  MODO ESCANEO (alta de llaveros desde la web)
+// ============================================================
+void consultarRed() {
+ if (WiFi.status() != WL_CONNECTED) return;
+ unsigned long ahora = millis();
 
-    case 1:
-      if (tecla >= '0' && tecla <= '9') {
-        if (bufferAula.length() < 3) {
-          bufferAula += tecla;
-          dibujarAula();
-        }
-      } else if (tecla == '#') {
-        if (bufferAula.length() == 0) break;
-        if (solicitud.activa && solicitud.nRfids > 0) {
-          // Pedido hecho desde la web: ya está validado y el préstamo registrado.
-          if (bufferAula.toInt() == solicitud.aulaId) {
-            if (solicitud.requierePin) {
-              pantalla = 2;
-              bufferPin = "";
-              dibujarPin();
-            } else {
-              pantalla = 3;
-              dibujarGirando();
-              buscarYLlevarLlave();
-            }
-          } else {
-            dibujarError("Aula invalida");
-            delay(1500);
-            bufferAula = "";
-            dibujarAula();
-          }
-        } else {
-          // Flujo por rostro: se consulta disponibilidad y se dispensa.
-          solicitarLlave(bufferAula);
-        }
-      } else if (tecla == '*') {
-        bufferAula = "";
-        dibujarAula();
-      } else if (tecla == 'D') {
-        resetSesion();
-      }
-      break;
+ // 1) ¿El admin pidió escanear un llavero nuevo?
+ if (ahora - ultimaConsultaEscaneoMs > CONSULTA_ESCANEO_MS) {
+   ultimaConsultaEscaneoMs = ahora;
+   String r = peticionHTTP("/dispensador/modo-escaneo", "", 1500);
+   bool activo = r.indexOf("\"activo\":true") >= 0;
+   if (activo != modoEscaneo) {
+     modoEscaneo = activo;
+     lcdSucio = true;
+   }
+ }
+ if (modoEscaneo) return;
 
-    case 2: {
-      if (tecla >= '0' && tecla <= '9') {
-        if (bufferPin.length() < 6) {
-          bufferPin += tecla;
-          dibujarPin();
-        }
-      } else if (tecla == '#') {
-        if (bufferPin.length() == 0) break;
-        if (validarPinEnServidor(bufferPin)) {
-          pantalla = 3;
-          dibujarGirando();
-          buscarYLlevarLlave();
-        } else {
-          estado.intentosPin++;
-          dibujarError("PIN incorrecto " + String(MAX_INTENTOS_PIN - estado.intentosPin));
-          delay(2000);
-          bufferPin = "";
-          if (estado.intentosPin >= MAX_INTENTOS_PIN) {
-            notificarEvento("bloqueado", "max intentos PIN en teclado");
-            resetSesion();
-          } else {
-            dibujarPin();
-          }
-        }
-      } else if (tecla == '*') {
-        bufferPin = "";
-        dibujarPin();
-      }
-      break;
-    }
+ // 2) ¿Hay un pedido hecho desde la web? Tiene prioridad sobre el rostro.
+ if (ahora - ultimaPeticionMs > CONSULTA_SOLICITUD_MS) {
+   ultimaPeticionMs = ahora;
+   if (peticionSolicitud()) {
+     iniciarSolicitudWeb();
+     return;
+   }
+ }
 
-    case 3:
-      if (tecla == 'D') {
-        detenerMotor();
-        notificarEvento("error", "cancelado por el usuario");
-        resetSesion();
-      }
-      break;
-
-    case 4:
-    case 5:
-      resetSesion();
-      break;
-  }
+ // 3) ¿La cámara reconoció a alguien?
+ if (ahora - ultimaConsultaRostroMs > CONSULTA_ROSTRO_MS) {
+   ultimaConsultaRostroMs = ahora;
+   consultarRostro();
+ }
 }
 
-// ===== RESET =====
-void resetSesion() {
-  detenerMotor();
-  solicitud = SolicitudLlave();
-  personaReconocida = "";
-  estado.intentosPin = 0;
-  bufferAula = "";
-  bufferPin  = "";
-  pantalla   = 0;
-  dibujarInicio();
+void procesarEscaneo() {
+ if (!hayTarjetaPresente()) return;
+
+ String uid = uidAString(uidActual);
+ Serial.println("UID escaneado: " + uid);
+
+ StaticJsonDocument<96> doc;
+ doc["uid"] = uid;
+ String cuerpo;
+ serializeJson(doc, cuerpo);
+ String resp = peticionHTTP("/dispensador/escaneo", cuerpo, 3000);
+
+ if (resp.indexOf("\"ok\":true") >= 0) mostrarLCD("Tag leido", uid);
+ else                                  mostrarLCD("Escaneo fallido", "Reintente");
+
+ modoEscaneo = false;
+ delay(2000);
+ lcdSucio = true;
 }
 
-// ===== BÚSQUEDA DE LA LLAVE (gira + lee RFID) =====
-bool buscarYLlevarLlave() {
-  pantalla = 3;
-  dibujarGirando();
 
-  if (solicitud.nRfids == 0) {
-    notificarEvento("error", "el aula no tiene tag RFID");
-    dibujarError("Llave sin tag");
-    pantalla = 5;
-    return false;
-  }
+// ============================================================
+//  SETUP / LOOP
+// ============================================================
+void setup() {
+ Serial.begin(115200);
+ SPI.begin();
+ rfid.PCD_Init();
 
-  long pulsosInicio     = estado.pulsosEncoder;
-  unsigned long tInicio = millis();
-  bool encontrada       = false;
+ pinMode(MOTOR_IN3, OUTPUT);
+ pinMode(MOTOR_IN4, OUTPUT);
+ pinMode(LED_VERDE, OUTPUT);
+ pinMode(LED_ROJO, OUTPUT);
+ detenerMotor();
 
-  mostrarEnLCD("Girando...", "buscando tag");
+ lcd.init();
+ lcd.backlight();
 
-  while (millis() - tInicio < TIMEOUT_GIRO_MS) {
-    girarMotor(VEL_MOTOR);
+ actualizarLed();
+ setupWiFi();
+ volverAInicio();
+}
 
-    String uid = leerRFID();
-    if (!uid.isEmpty()) {
-      Serial.printf("RFID: %s\n", uid.c_str());
-      if (esTagObjetivo(uid)) {
-        detenerMotor();
-        delay(150);
-        digitalWrite(PIN_IN3, LOW);
-        analogWrite(PIN_IN4, VEL_MOTOR);
-        delay(120);
-        analogWrite(PIN_IN4, 0);
-        detenerMotor();
-        encontrada = true;
-        break;
-      }
-    }
+void loop() {
 
-    if (estado.pulsosEncoder - pulsosInicio > PULSOS_POR_VUELTA) break;
-    delay(30);
-  }
+ mantenerWiFi();
 
-  detenerMotor();
+ // La tecla D frena el motor en cualquier momento mientras se mueve
+ if (estado == BUSCANDO_LLAVE || estado == BUSCANDO_VACIO || estado == LIMPIANDO_POSICION) {
+   char t = teclado.getKey();
+   if (t == 'D') {
+     cancelarPorUsuario();
+     return;
+   }
+ }
 
-  if (!encontrada) {
-    Serial.println("Llave no encontrada");
-    notificarEvento("error", "no encontrada tras una vuelta");
-    dibujarError("Llave no hallada");
-    pantalla = 5;
-    return false;
-  }
 
-  Serial.println("Llave posicionada");
-  notificarEvento("encontrada", "posicionada");
+ switch (estado) {
 
-  pantalla = 4;
-  dibujarEntregado(solicitud.aulaNombre);
-  unsigned long tRetiro = millis();
-  while (millis() - tRetiro < TIEMPO_RETIRO_MS) {
-    if (teclado.getKey()) break;
-    delay(100);
-  }
-  notificarEvento("entregada", "llave retirada");
-  resetSesion();
-  return true;
+
+   case REPOSO: {
+     if (lcdSucio) {
+       dibujarReposo();
+       lcdSucio = false;
+     }
+
+     char tecla = teclado.getKey();
+
+     // Sin rostro obligatorio, se puede tipear el aula directo
+     if (!EXIGIR_ROSTRO && !modoEscaneo && tecla >= '0' && tecla <= '9') {
+       bufferAula = "";
+       estado = ESPERANDO_AULA;
+       inicioSesionMs = millis();
+       lcdSucio = true;
+       procesarTeclaAula(tecla);
+       return;
+     }
+
+     consultarRed();
+     if (estado != REPOSO) break;
+
+     if (modoEscaneo) {
+       procesarEscaneo();
+       break;
+     }
+
+     // Un llavero apoyado en reposo es una devolución
+     if (hayTarjetaPresente()) {
+       estado = DEVOLUCION_DETECTADA;
+       lcdSucio = true;
+     }
+     break;
+   }
+
+
+
+
+   case ESPERANDO_AULA: {
+     if (lcdSucio) {
+       mostrarLCD("Nro de aula:", "Aula:" + bufferAula + "  #");
+       lcdSucio = false;
+     }
+
+     if (millis() - inicioSesionMs > TIMEOUT_SESION_MS) {
+       volverAInicio();
+       break;
+     }
+
+     char tecla = teclado.getKey();
+     if (tecla) {
+       inicioSesionMs = millis();
+       procesarTeclaAula(tecla);
+     }
+     break;
+   }
+
+
+
+
+   case ESPERANDO_PIN: {
+     if (lcdSucio) {
+       String oculto = "";
+       for (unsigned int i = 0; i < bufferPin.length(); i++) oculto += "*";
+       mostrarLCD("Ingrese PIN:", oculto + " #");
+       lcdSucio = false;
+     }
+
+     if (millis() - inicioSesionMs > TIMEOUT_SESION_MS) {
+       notificarEvento("error", "tiempo agotado en PIN");
+       volverAInicio();
+       break;
+     }
+
+     char tecla = teclado.getKey();
+     if (!tecla) break;
+     inicioSesionMs = millis();
+
+     if (tecla >= '0' && tecla <= '9') {
+       if (bufferPin.length() < 6) { bufferPin += tecla; lcdSucio = true; }
+     } else if (tecla == '*') {
+       bufferPin = "";
+       lcdSucio = true;
+     } else if (tecla == 'D') {
+       cancelarPorUsuario();
+     } else if (tecla == '#' && bufferPin.length() > 0) {
+       if (validarPinEnServidor(bufferPin)) {
+         bufferPin = "";
+         iniciarBusqueda();
+       } else {
+         intentosPin++;
+         mostrarLCD("PIN incorrecto", "Quedan " + String(MAX_INTENTOS_PIN - intentosPin));
+         delay(2000);
+         bufferPin = "";
+         if (intentosPin >= MAX_INTENTOS_PIN) {
+           notificarEvento("bloqueado", "max intentos PIN en teclado");
+           volverAInicio();
+         } else {
+           lcdSucio = true;
+         }
+       }
+     }
+     break;
+   }
+
+
+
+
+   case BUSCANDO_LLAVE: {
+     if (lcdSucio) {
+       mostrarLCD("Buscando llave...", "D = cancelar");
+       lcdSucio = false;
+     }
+
+
+     // Mientras el motor está en pulso no se lee nada (no bloquea: el teclado sigue activo)
+     if (motorPulsando) {
+       if (pulsoTerminado()) detenerMotor();
+       break;
+     }
+
+
+     // Motor quieto: se lee lo que quedó frente al lector
+     pulsosBusqueda++;
+
+
+     if (hayTarjetaPresente()) {
+
+
+       // 1) ¿Es la llave buscada?
+       if (esLlaveObjetivo()) {
+         detenerMotor();
+         reiniciarBusqueda();
+         String uid = uidAString(uidActual);
+         marcarFaltante(uid);
+         notificarEvento("encontrada", "posicionada", uid);
+         inicioGracia = millis();
+         estado = LLAVE_ENCONTRADA;
+         lcdSucio = true;
+         break;
+       }
+
+
+       // 2) El primer llavero que pasa queda como referencia
+       if (!tieneReferencia) {
+         for (int i = 0; i < 4; i++) uidReferencia[i] = uidActual[i];
+         tieneReferencia = true;
+         referenciaAbandonada = false;
+       }
+       // 3) Volvió a pasar la referencia: dio la vuelta completa
+       else if (uidCoincide(uidActual, uidReferencia)) {
+         if (referenciaAbandonada) {
+           estado = BUSCANDO_VACIO;   // sigue hasta el próximo hueco sin llavero
+           pulsosBusqueda = 0;
+           lcdSucio = true;
+           iniciarPulsoMotor();
+           break;
+         }
+         // si no se abandonó, sigue siendo la misma lectura de antes: no cuenta
+       }
+       // 4) Otro llavero distinto: la referencia ya se fue del lector
+       else {
+         referenciaAbandonada = true;
+       }
+
+
+     } else {
+       // Hueco sin llavero: si ya hay referencia, significa que se alejó de ella
+       if (tieneReferencia) referenciaAbandonada = true;
+     }
+
+
+     // Seguridad: demasiados pasos sin completar vuelta (rueda vacía o llavero atascado)
+     if (pulsosBusqueda >= MAX_PULSOS_BUSQUEDA) {
+       detenerMotor();
+       reiniciarBusqueda();
+       notificarEvento("error", "no encontrada (limite de pasos)");
+       estado = LLAVE_NO_ENCONTRADA;
+       lcdSucio = true;
+       inicioGracia = millis();
+       break;
+     }
+
+
+     iniciarPulsoMotor();
+     break;
+   }
+
+
+
+
+   // Vuelta completa sin encontrar la llave: avanza hasta el siguiente espacio vacío y se detiene
+   case BUSCANDO_VACIO: {
+     if (lcdSucio) {
+       mostrarLCD("No esta en la", "rueda, ajustando");
+       lcdSucio = false;
+     }
+
+
+     if (motorPulsando) {
+       if (pulsoTerminado()) detenerMotor();
+       break;
+     }
+
+
+     pulsosBusqueda++;
+
+
+     if (!hayTarjetaPresente() || pulsosBusqueda >= MAX_PULSOS_VACIO) {
+       detenerMotor();
+       reiniciarBusqueda();
+       notificarEvento("error", "no encontrada tras una vuelta");
+       estado = LLAVE_NO_ENCONTRADA;
+       lcdSucio = true;
+       inicioGracia = millis();
+     } else {
+       iniciarPulsoMotor();
+     }
+     break;
+   }
+
+
+
+
+   case LLAVE_NO_ENCONTRADA: {
+     if (lcdSucio) {
+       mostrarLCD("Llave no hallada", "Aula " + aulaPedida);
+       digitalWrite(LED_ROJO, HIGH);
+       lcdSucio = false;
+     }
+
+
+     if (millis() - inicioGracia >= TIEMPO_MENSAJE_MS) {
+       actualizarLed();
+       volverAInicio();
+     }
+     break;
+   }
+
+
+
+
+   case LLAVE_ENCONTRADA: {
+     if (lcdSucio) {
+       mostrarLCD("Listo! Aula " + aulaPedida, "Llave encontrada");
+       lcdSucio = false;
+     }
+
+
+     if (millis() - inicioGracia >= TIEMPO_GRACIA_MS) {
+       notificarEvento("entregada", "llave retirada");
+       volverAInicio();
+     }
+     break;
+   }
+
+
+
+
+   case DEVOLUCION_DETECTADA: {
+     String uid = uidAString(uidActual);
+     quitarFaltante(uid);
+
+     // Le pregunta al servidor de qué aula es y lo deja registrado
+     String resp = peticionHTTP("/dispensador/llave-por-uid/" + uid, "", 2000);
+     if (resp.length() > 0) {
+       StaticJsonDocument<192> doc;
+       if (!deserializeJson(doc, resp) && (doc["ok"] | false)) {
+         aulaPedida = doc["aula"].as<String>();
+         mostrarLCD("Llave devuelta", "Aula " + aulaPedida);
+         notificarEvento("devuelta", "", uid);
+         delay(1500);
+       }
+     }
+
+     estado = LIMPIANDO_POSICION;
+     iniciarPulsoMotor();
+     lcdSucio = true;
+     break;
+   }  
+
+
+
+
+   case LIMPIANDO_POSICION: {
+     if (motorPulsando) {
+       if (pulsoTerminado()) detenerMotor();
+       break;
+     }
+
+
+     if (hayTarjetaPresente()) {
+       iniciarPulsoMotor();
+     } else {
+       volverAInicio();
+     }
+     break;
+   }
+ }
 }
