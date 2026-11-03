@@ -1,6 +1,6 @@
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { api, ApiError } from './api.js'
+import { api, subirFoto, ApiError } from './api.js'
 
 const fetchOriginal = globalThis.fetch
 afterEach(() => { globalThis.fetch = fetchOriginal })
@@ -33,4 +33,19 @@ test('conserva el mensaje y código HTTP de errores de la API', async () => {
   globalThis.fetch = async () => new Response(JSON.stringify({ detail: 'Sesión no válida' }), { status: 401 })
   await assert.rejects(api('/mis_fotos'), (error) =>
     error instanceof ApiError && error.status === 401 && error.message === 'Sesión no válida')
+})
+
+test('sube una foto como multipart con el token del usuario', async () => {
+  globalThis.fetch = async (path, options) => {
+    assert.equal(path, '/subir_foto')
+    assert.equal(options.method, 'POST')
+    assert.equal(options.headers['x-token'], 'token-de-prueba')
+    assert.equal(options.headers['Content-Type'], undefined)
+    assert.ok(options.body instanceof FormData)
+    assert.equal(options.body.get('archivo').name, 'foto.jpg')
+    return new Response(JSON.stringify({ ok: true, archivo: 'ana1.jpg', estado: 'pendiente' }), { status: 200 })
+  }
+  const foto = new File([new Blob(['jpeg'], { type: 'image/jpeg' })], 'foto.jpg', { type: 'image/jpeg' })
+  assert.deepEqual(await subirFoto(foto, 'token-de-prueba'),
+    { ok: true, archivo: 'ana1.jpg', estado: 'pendiente' })
 })

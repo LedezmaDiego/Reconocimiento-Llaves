@@ -2,6 +2,9 @@
 
 Sistema de control de casilleros de llaves con reconocimiento facial y dispensador motorizado.
 
+API completa (59 endpoints, con auth, cuerpos, respuestas y ejemplos `curl`):
+[`docs/ENDPOINTS.md`](ENDPOINTS.md).
+
 ## Arranque rápido
 
 ```bash

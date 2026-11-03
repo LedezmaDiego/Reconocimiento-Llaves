@@ -1,6 +1,7 @@
 import threading
 import time
 
+from config import RECONOCIDO_REPETIR_S
 from logs import log
 
 MODO = {"valor": "reconocimiento", "hasta": 0.0}
@@ -12,6 +13,25 @@ ULTIMO_RESULTADO = {"texto": "Sin datos todavia"}
 ULTIMA_AUTORIZACION: dict[str, tuple[str, float]] = {}
 
 ACCESO_CODIGO: dict[str, tuple[str, float]] = {}
+
+# Último rostro autorizado que vio la cámara. El dispensador lo consulta para
+# mostrar "Bienvenido <persona>" y habilitar el pedido por teclado.
+RECONOCIDO: dict = {"persona": "", "ts": 0.0, "seq": 0, "ultimo_aviso": 0.0}
+
+
+def registrar_reconocido(persona: str) -> None:
+    """Anota el rostro autorizado; avisa de nuevo solo si cambia o pasa el tiempo."""
+    if not persona:
+        return
+    ahora = time.time()
+    mismo = persona.lower() == RECONOCIDO["persona"].lower()
+    if mismo and ahora - RECONOCIDO["ultimo_aviso"] < RECONOCIDO_REPETIR_S:
+        # Sigue la misma persona delante: solo se refresca la vigencia.
+        RECONOCIDO["ts"] = ahora
+        return
+    RECONOCIDO.update({"persona": persona, "ts": ahora,
+                       "seq": RECONOCIDO["seq"] + 1, "ultimo_aviso": ahora})
+
 
 INTENTOS: dict[str, list] = {}          # usuarios y "admin:<ip>"
 

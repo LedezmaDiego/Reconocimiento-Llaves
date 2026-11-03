@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { api } from '../api.js'
+import { api, subirFoto } from '../api.js'
 
 function notificar(titulo, texto) {
   try {
@@ -7,6 +7,35 @@ function notificar(titulo, texto) {
       new Notification(titulo, { body: texto })
     }
   } catch { /* La notificación del navegador es opcional. */ }
+}
+
+function Foto({ archivo, estado, token, onDelete }) {
+  const [url, setUrl] = useState(null)
+  useEffect(() => {
+    let activo = true
+    let imagen
+    api(`/foto/${encodeURIComponent(archivo)}`, { token, response: 'blob' })
+      .then((blob) => {
+        imagen = URL.createObjectURL(blob)
+        if (activo) setUrl(imagen)
+        else URL.revokeObjectURL(imagen)
+      })
+      .catch(() => {})
+    return () => {
+      activo = false
+      if (imagen) URL.revokeObjectURL(imagen)
+    }
+  }, [archivo, token])
+
+  return (
+    <div className="item">
+      {url ? <img src={url} alt={`Foto ${archivo}`} /> : <div className="foto-vacia">Cargando…</div>}
+      <div className={estado === 'pendiente' ? 'pend' : ''}>
+        {archivo}{estado === 'pendiente' ? ' (verificando…)' : ''}
+      </div>
+      <button className="rojo chico" onClick={() => onDelete(archivo)}>Borrar</button>
+    </div>
+  )
 }
 
 const ETIQUETA_ESTADO = {
@@ -77,6 +106,10 @@ export function Panel({ sesion, onSalir }) {
   const [aulas, setAulas] = useState([])
   const [mensajeAulas, setMensajeAulas] = useState('')
   const [pedido, setPedido] = useState(null)
+  const [fotos, setFotos] = useState([])
+  const [mensajeFoto, setMensajeFoto] = useState('')
+  const [subiendo, setSubiendo] = useState(false)
+  const [capturando, setCapturando] = useState(false)
   const estadoAnterior = useRef(null)
 
   // Una sola salida que apaga también el modo registro de la placa.
@@ -127,6 +160,80 @@ export function Panel({ sesion, onSalir }) {
     return () => { activo = false; clearTimeout(timer) }
   }, [sesion.token, estado?.estado_usuario])
 
+  useEffect(() => {
+    if (estado?.estado_usuario !== 'aprobado') return
+    let activo = true
+    let timer
+    async function consultar() {
+      try {
+        const datos = await api('/mis_fotos', { token: sesion.token })
+        if (!activo) return
+        setFotos(datos.fotos)
+        if (datos.avisos?.length) setMensajeFoto(`Foto rechazada: ${datos.avisos.join(' | ')}`)
+        timer = setTimeout(consultar, datos.fotos.some((f) => f.estado === 'pendiente') ? 2000 : 6000)
+      } catch (error) {
+        if (activo && error.status === 401) { onSalir(); return }
+        if (activo) timer = setTimeout(consultar, 8000)
+      }
+    }
+    consultar()
+    return () => { activo = false; clearTimeout(timer) }
+  }, [sesion.token, estado?.estado_usuario])
+
+  async function refrescarFotos() {
+    try {
+      const datos = await api('/mis_fotos', { token: sesion.token })
+      setFotos(datos.fotos)
+      if (datos.avisos?.length) setMensajeFoto(`Foto rechazada: ${datos.avisos.join(' | ')}`)
+    } catch { /* El sondeo periódico vuelve a intentar. */ }
+  }
+
+  async function borrarFoto(archivo) {
+    if (!window.confirm(`¿Borrar la foto ${archivo}?`)) return
+    try {
+      await api(`/foto/${encodeURIComponent(archivo)}`, { method: 'DELETE', token: sesion.token })
+      setMensajeFoto(`Foto borrada: ${archivo}`)
+      await refrescarFotos()
+    } catch (error) { setMensajeFoto(`Error: ${error.message}`) }
+  }
+
+  async function subirFotos(evento) {
+    const archivos = Array.from(evento.target.files || [])
+    evento.target.value = ''
+    if (!archivos.length) return
+    setSubiendo(true)
+    setMensajeFoto('')
+    let guardadas = 0
+    const errores = []
+    for (const archivo of archivos) {
+      try {
+        await subirFoto(archivo, sesion.token)
+        guardadas += 1
+      } catch (error) { errores.push(`${archivo.name}: ${error.message}`) }
+    }
+    setSubiendo(false)
+    setMensajeFoto(guardadas
+      ? `${guardadas} foto(s) subida(s). Se verifican solas en unos segundos.${errores.length ? ` ${errores[0]}` : ''}`
+      : `No se pudo subir: ${errores[0] || 'archivo inválido'}`)
+    await refrescarFotos()
+  }
+
+  async function capturarConCamara() {
+    setCapturando(true)
+    setMensajeFoto('')
+    try {
+      await api('/modo?m=registro', { method: 'POST', token: sesion.token })
+      const res = await api('/guardar_lote?cantidad=5', { method: 'POST', token: sesion.token })
+      setMensajeFoto(res.mensaje || 'Fotos capturadas. Se verifican solas en unos segundos.')
+    } catch (error) {
+      setMensajeFoto(`No se pudo capturar: ${error.message}`)
+    } finally {
+      try { await api('/modo?m=reconocimiento', { method: 'POST', token: sesion.token }) } catch { /* El modo caduca solo. */ }
+      setCapturando(false)
+    }
+    await refrescarFotos()
+  }
+
   async function devolver(aula) {
     if (!window.confirm(`¿Devolver la llave de ${aula.nombre}?`)) return
     try {
@@ -155,6 +262,29 @@ export function Panel({ sesion, onSalir }) {
       {estado?.estado_usuario === 'rechazado' && <section className="card"><h2>Solicitud rechazada <span className="badge b-rechazado">Rechazada</span></h2><p>Hablá con el administrador si creés que es un error.</p></section>}
 
       {aprobado && <>
+        <section className="card">
+          <h2>Fotos para el reconocimiento</h2>
+          <p className="mut">Subí fotos de tu cara mirando de frente y con buena luz. Se verifican solas en unos segundos y quedan habilitadas para el llavero.</p>
+          {mensajeFoto && <div role="status" className="aviso info">{mensajeFoto}</div>}
+          <div className="fila">
+            <label className="crecer">Subir desde la computadora
+              <input type="file" accept="image/jpeg,image/png,image/webp" multiple
+                     onChange={subirFotos} disabled={subiendo || capturando} />
+            </label>
+            <button className="ghost" onClick={capturarConCamara} disabled={subiendo || capturando}>
+              {capturando ? 'Capturando…' : 'Capturar 5 fotos con la cámara'}
+            </button>
+          </div>
+          {subiendo && <p className="mut">Subiendo fotos…</p>}
+          <h3 className="separado">Mis fotos ({fotos.length})</h3>
+          {fotos.length ? (
+            <div className="grid">
+              {fotos.map((f) => <Foto key={f.archivo} archivo={f.archivo} estado={f.estado}
+                                      token={sesion.token} onDelete={borrarFoto} />)}
+            </div>
+          ) : <p className="mut">Todavía no cargaste fotos.</p>}
+        </section>
+
         <section className="card">
           <h2>Llaves de aulas</h2>
           {mensajeAulas && <div role="status" className="aviso info">{mensajeAulas}</div>}

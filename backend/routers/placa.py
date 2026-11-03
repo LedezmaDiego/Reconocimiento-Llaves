@@ -10,7 +10,8 @@ from config import (BASE_DIR, CASILLERO_DEFECTO, CODIGO_VALIDO_S, UMBRAL,
                     VENTANA_RETIRO_S, MIN_BYTES_IMAGEN)
 from db import db, registrar_estado
 from estado import (ACCESO_CODIGO, LOGIN_ROSTRO, ULTIMA_AUTORIZACION, ULTIMA_FOTO,
-                    ULTIMO_RESULTADO, SOLICITUD_LLAVE, modo_actual)
+                    ULTIMO_RESULTADO, SOLICITUD_LLAVE, modo_actual,
+                    registrar_reconocido)
 from logs import log
 from pocketbase import guardar_foto
 from reconocimiento import comparar_rostro
@@ -96,6 +97,7 @@ async def reconocer_rostro(request: Request):
 
         if res["autorizado"]:
             ULTIMA_AUTORIZACION[casillero_id] = (res["persona"], time.time())
+            registrar_reconocido(res["persona"])
             ULTIMO_RESULTADO["texto"] = f"ACCESO PERMITIDO: {res['persona']} ({datetime.now().strftime('%H:%M:%S')})"
             log("ACCESO PERMITIDO", f"{res['persona']} (dist: {res['distancia']:.3f})")
             await run_in_threadpool(guardar_foto, cuerpo, "reconocimiento",

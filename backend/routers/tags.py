@@ -5,6 +5,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from seguridad import autenticar_admin
+from db import aula_por_numero
 from pocketbase import pb, normalizar_uid, UID_RE
 
 router = APIRouter()
@@ -62,13 +63,26 @@ def _validar_uid(uid: str) -> str:
 def _crear(uid: str, numero_aula: str):
     if _uid_repetido(uid):
         raise HTTPException(status_code=400, detail="Ese UID ya está registrado")
+    # El panel solo pide UID y número; el resto de campos son obligatorios en PocketBase.
+    campos = _campos_de_aula(numero_aula)
     return _check(pb("POST", f"/api/collections/{COLECCION}/records",
-                     json={"uid": uid, "numero_aula": numero_aula}))
+                     json={"uid": uid, "tipo": "llave", "activo": True, **campos}))
+
+
+def _campos_de_aula(numero_aula: str) -> dict:
+    """Completa nombre y llave_id a partir del número de aula escrito."""
+    aula = aula_por_numero(numero_aula)
+    campos = {"numero_aula": numero_aula,
+              "nombre": aula["nombre"] if aula else f"Aula {numero_aula}",
+              "llave_id": str(aula["id"]) if aula else ""}
+    return campos
 
 
 def _editar(tag_id: str, campos: dict):
     if "uid" in campos and _uid_repetido(campos["uid"], tag_id):
         raise HTTPException(status_code=400, detail="Ese UID ya está registrado")
+    if "numero_aula" in campos:
+        campos = {**campos, **_campos_de_aula(campos["numero_aula"])}
     return _check(pb("PATCH", f"/api/collections/{COLECCION}/records/{tag_id}", json=campos))
 
 

@@ -35,12 +35,21 @@ COLECCION_SESIONES = "sesiones"
 # ---------------- Usuarios ----------------
 MAX_FOTOS_POR_USUARIO = 15
 REGISTRO_TIMEOUT_S = 120
+MAX_BYTES_SUBIDA = 8 * 1024 * 1024   # tope por foto subida desde la computadora
+LADO_MAX_SUBIDA = 1600               # se redimensiona para que la verificación sea rápida
 SESION_S = 31536000    # 1 año (persistente en PocketBase)
 CODIGO_VALIDO_S = 30
 MAX_INTENTOS = 5
 BLOQUEO_S = 60
 CASILLERO_DEFECTO = "C01"
 RESERVADOS = {"admin", "administrador", "root"}
+
+# ---------------- Dispensador: rostro reconocido ----------------
+# El ESP32-CAM avisa cada rostro autorizado y el dispensador lo consulta para
+# saludar y dejar pedir la llave por teclado.
+RECONOCIDO_VIGENCIA_S = 30    # un rostro se considera presente durante este tiempo
+RECONOCIDO_REPETIR_S = 60     # no volver a avisar del mismo rostro antes de esto
+PRESTAMO_DURACION_H = 2       # duración por defecto del préstamo pedido en el dispensador
 
 # ---------------- Aulas y préstamos de llaves ----------------
 LOGIN_ROSTRO_TIMEOUT_S = 90   # validez de una solicitud de inicio de sesión por rostro

@@ -141,6 +141,7 @@ def asegurar_coleccion_tags() -> None:
         [
             {"name": "uid", "type": "text", "required": True},
             {"name": "nombre", "type": "text", "required": True},
+            {"name": "numero_aula", "type": "text", "required": False},
             {"name": "llave_id", "type": "text", "required": False},
             {"name": "tipo", "type": "select", "required": True,
              "maxSelect": 1, "values": ["llave", "tarjeta"]},
@@ -151,8 +152,28 @@ def asegurar_coleccion_tags() -> None:
         [
             "CREATE UNIQUE INDEX idx_tags_uid ON tags (uid)",
             "CREATE INDEX idx_tags_llave ON tags (llave_id)",
+            "CREATE INDEX idx_tags_numero ON tags (numero_aula)",
         ],
     )
+    # Bases creadas con la versión anterior: agregar el número de aula sin perder datos.
+    _agregar_campo("tags", {"name": "numero_aula", "type": "text", "required": False})
+
+
+def _agregar_campo(coleccion: str, campo: dict) -> None:
+    """Agrega un campo a una colección existente si todavía no lo tiene."""
+    r = pb("GET", f"/api/collections/{coleccion}")
+    if r.status_code != 200:
+        return
+    campos = r.json().get("fields", [])
+    if any(f.get("name") == campo["name"] for f in campos):
+        return
+    campos.append(campo)
+    r = pb("PATCH", f"/api/collections/{coleccion}", json={"fields": campos})
+    if r.status_code == 200:
+        log("POCKETBASE", f"Campo '{campo['name']}' agregado a '{coleccion}'")
+    else:
+        log("POCKETBASE", f"No pude agregar '{campo['name']}' a '{coleccion}': "
+                          f"{r.status_code} {r.text[:LONGITUD_TEXTO_COLECCION]}")
 
 
 def limpiar_sesiones_expiradas() -> None:

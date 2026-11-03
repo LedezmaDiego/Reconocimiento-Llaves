@@ -1,11 +1,14 @@
 import time
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from config import MAX_INTENTOS
+from config import MAX_INTENTOS, PRESTAMO_DURACION_H, RECONOCIDO_VIGENCIA_S
 from db import (aula_por_id, registrar_prestamo, prestamo_activo)
-from estado import SOLICITUD_LLAVE, LOCK_SOLICITUD, ULTIMA_AUTORIZACION, ULTIMO_EVENTO_DISPENSADOR
-from logs import log, obtener_hora
+from estado import (SOLICITUD_LLAVE, LOCK_SOLICITUD, RECONOCIDO,
+                    ULTIMA_AUTORIZACION, ULTIMO_EVENTO_DISPENSADOR)
+from logs import log
 from pocketbase import uids_activos, listar_tags
 from schemas import PedidoDispensador, PinDispensador, EventoDispensador
 from seguridad import verificar_pin
@@ -70,6 +73,16 @@ def _registrar_acierto_rostro(aula_id: int, persona: str) -> None:
     """El rostro fue aprobado: reinicia la cuenta de fallos de esa aula."""
     _INTENTOS_ROSTRO.pop(aula_id, None)
     log("DISPENSADOR", f"Rostro aprobado para aula {aula_id}: {persona or '?'}")
+
+
+@router.get("/dispensador/reconocido")
+async def rostro_reconocido() -> dict:
+    """Último rostro autorizado por la cámara (el dispensador lo consulta para saludar)."""
+    edad = time.time() - RECONOCIDO["ts"]
+    if RECONOCIDO["persona"] and edad <= RECONOCIDO_VIGENCIA_S:
+        return {"reconocido": True, "persona": RECONOCIDO["persona"],
+                "seq": RECONOCIDO["seq"], "edad": int(edad)}
+    return {"reconocido": False}
 
 
 @router.get("/dispensador/solicitud")
@@ -156,8 +169,10 @@ async def confirmar_evento(datos: EventoDispensador) -> dict:
             # se registra recién ahora. Si vino de la web, ya existe uno activo.
             persona = datos.persona or _snapshot_solicitud().get("persona") or None
             ULTIMA_AUTORIZACION[str(aula["id"])] = (persona or "Desconocido", time.time())
+            hasta = (datetime.now() + timedelta(hours=PRESTAMO_DURACION_H)).strftime(
+                "%Y-%m-%d %H:%M:%S")
             registrar_prestamo(aula["id"], persona or "Desconocido",
-                               "Retiro en dispensador", obtener_hora(), persona or "dispensador")
+                               "Retiro en dispensador", hasta, persona or "dispensador")
         _limpiar_solicitud()
     elif datos.evento == "error":
         log("DISPENSADOR", f"Error en '{nombre}': {datos.detalle}")

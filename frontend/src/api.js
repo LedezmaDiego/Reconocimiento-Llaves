@@ -28,3 +28,23 @@ export async function api(path, { method = 'GET', body, token, adminToken, respo
   }
   return response === 'blob' ? result.blob() : result.json()
 }
+
+// Subida de una foto como multipart (no se puede mandar como JSON).
+export async function subirFoto(archivo, token) {
+  const datos = new FormData()
+  datos.append('archivo', archivo)
+  const result = await fetch('/subir_foto', {
+    method: 'POST',
+    headers: token ? { 'x-token': token } : {},
+    body: datos,
+  })
+  if (!result.ok) {
+    let detail
+    try {
+      const data = await result.json()
+      detail = data.detail || data.mensaje
+    } catch { /* Algunas respuestas no tienen cuerpo JSON. */ }
+    throw new ApiError(typeof detail === 'string' ? detail : `Error HTTP ${result.status}`, result.status)
+  }
+  return result.json()
+}

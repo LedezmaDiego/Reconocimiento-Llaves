@@ -38,9 +38,10 @@ Al iniciar `backend/main.py` crea las colecciones privadas `personal` y `sesione
 - La placa envía JPEG sin envoltorio a `/reconocimiento` con cabecera `X-Casillero-Id`; la respuesta usa `"modo"` y `"autorizado"` — conservar ese formato al tocar la API.
 - Por ahora solo informa autorización por puerto serie: **no** llama `/retiro` ni `/devolucion`, ni acciona cerradura.
 - `firmware/dispensador.ino`: pines GPIO fijos (GPIO 34-39 son entrada only). No cambiar sin revisar la tabla de conexiones.
+- Flujo del dispensador: el ESP32-CAM reconoce el rostro y el servidor guarda al último autorizado; el dispensador consulta `GET /dispensador/reconocido`, muestra "Bienvenido <persona>", pide el número de aula por teclado y consulta `GET /dispensador/llave/{numero}`. Ese endpoint valida aula activa y préstamo vigente (SQLite) y devuelve los UID RFID; al entregar, el evento `entregada` registra el préstamo con duración por defecto (`PRESTAMO_DURACION_H`).
 
 ## Frontend
-- `/panel` (usuario) **solo muestra llaves de aulas**: la sección de cámara y fotos ("Registrar mi cara" / "Mis fotos") está eliminada del panel. Los endpoints `/modo`, `/guardar_foto`, `/guardar_lote`, `/mis_fotos` y `/ultima_foto` siguen en el backend pero ya no tienen UI.
+- `/panel` (usuario) muestra las llaves de aulas y la sección **"Fotos para el reconocimiento"**: subida de archivos (`POST /subir_foto`, multipart) y captura de 5 fotos con la cámara (`/modo?m=registro` + `/guardar_lote`). Debajo lista las fotos propias (`/mis_fotos`) con miniatura y borrado.
 - Las sesiones (usuario y admin) se persisten en `localStorage` (`frontend/src/sesion.js`), así sobreviven recargas. Si un token restaurado venció (401), la app lo descarta y pide login de nuevo.
 - Tras cambios en `frontend/src/`, rebuild obligatorio: `cd frontend && npm run build` (el backend sirve `frontend/dist/`).
 - Tests del frontend: `cd frontend && npm test` (`node --test src/*.test.js`).

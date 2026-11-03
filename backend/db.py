@@ -55,6 +55,23 @@ def aulas() -> list[dict]:
             ORDER BY a.nombre COLLATE NOCASE""").fetchall()
     return [dict(f) for f in filas]
 
+
+def aula_por_numero(numero: str) -> dict | None:
+    """Busca un aula por el número que se escribe en el dispensador.
+
+    Primero por nombre ("214" o "Aula 214", que es lo que conoce el usuario) y
+    después por id interno.
+    """
+    numero = (numero or "").strip()
+    if not numero.isdigit():
+        return None
+    buscado = f"aula {numero}".lower()
+    for a in aulas():
+        if a["nombre"].strip().lower() in (numero, buscado):
+            return a
+    return aula_por_id(int(numero))
+
+
 def aula_por_id(aula_id: int) -> dict | None:
     """Devuelve un aula por id o None si no existe."""
     with closing(db()) as con:

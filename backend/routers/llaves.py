@@ -4,8 +4,9 @@ from fastapi import APIRouter
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from db import aula_por_numero, prestamo_activo
 from logs import log
-from pocketbase import pb, normalizar_uid, UID_RE
+from pocketbase import pb, normalizar_uid, uids_activos, UID_RE
 
 router = APIRouter()
 
@@ -57,17 +58,36 @@ def _aula_de_uid(uid: str) -> str | None:
 
 @router.get("/dispensador/llave/{numero_aula}")
 async def pedir_llave(numero_aula: str):
-    """El dispensador pregunta qué UID(s) corresponden a un aula."""
+    """El dispensador pregunta por un aula: disponibilidad y UID(s) de la llave."""
     if not re.fullmatch(r"\d{1,6}", numero_aula):
-        return {"ok": False, "error": "Aula inválida."}
-    uids = await run_in_threadpool(_uids_de_aula, numero_aula)
+        return {"ok": False, "disponible": False, "error": "Aula inválida."}
+
+    aula = await run_in_threadpool(aula_por_numero, numero_aula)
+    if not aula:
+        log("LLAVES", f"Pedido de aula {numero_aula}: no existe")
+        return {"ok": False, "disponible": False, "error": "Esa aula no existe."}
+    if not aula["activa"]:
+        return {"ok": False, "disponible": False, "aula_id": aula["id"],
+                "aula_nombre": aula["nombre"], "error": "Esa aula está deshabilitada."}
+    if await run_in_threadpool(prestamo_activo, aula["id"]):
+        log("LLAVES", f"Pedido de aula {numero_aula}: llave no disponible")
+        return {"ok": True, "disponible": False, "aula": numero_aula,
+                "aula_id": aula["id"], "aula_nombre": aula["nombre"],
+                "motivo": "La llave no se encuentra disponible."}
+
+    # Primero los tags asociados a la llave (llave_id) y, si no hay, el número legacy.
+    uids = await run_in_threadpool(uids_activos, aula["id"], aula["rfid"])
+    if not uids:
+        uids = await run_in_threadpool(_uids_de_aula, numero_aula)
     if uids is None:
-        return {"ok": False, "error": "Base de datos no disponible."}
+        return {"ok": False, "disponible": False, "error": "Base de datos no disponible."}
     if not uids:
         log("LLAVES", f"Pedido de aula {numero_aula}: no tiene llavero cargado")
-        return {"ok": False, "error": "Esa aula no tiene llavero."}
+        return {"ok": False, "disponible": False, "aula_id": aula["id"],
+                "aula_nombre": aula["nombre"], "error": "Esa aula no tiene llavero."}
     log("LLAVES", f"Pedido de aula {numero_aula}: uids {uids}")
-    return {"ok": True, "aula": numero_aula, "uids": uids}
+    return {"ok": True, "disponible": True, "aula": numero_aula,
+            "aula_id": aula["id"], "aula_nombre": aula["nombre"], "uids": uids}
 
 
 @router.get("/dispensador/llave-por-uid/{uid}")

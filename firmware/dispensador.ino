@@ -13,6 +13,10 @@
  *   - Acepta varios tags por llave (campo "rfids" del servidor).
  *   - Modo escaneo: el admin pide escanear desde la web y el UID
  *     se envía al backend (MAYÚSCULAS, sin separadores).
+ *   - Flujo por rostro: la ESP32-CAM reconoce a la persona, el LCD
+ *     muestra "Bienvenido <persona>" y luego se escribe el número de
+ *     aula. El servidor confirma si la llave está disponible antes de
+ *     girar el carrusel.
  * ============================================================
  */
 
@@ -62,6 +66,11 @@ const int           PULSOS_POR_VUELTA     = 20;   // CALIBRAR
 const unsigned long CONSULTA_SOLICITUD_MS = 3000;
 const unsigned long CONSULTA_ESCANEO_MS   = 1000;
 const int           MAX_TAGS              = 8;
+// Flujo por rostro: el ESP32-CAM reconoce y el dispensador saluda y pide el aula.
+const unsigned long CONSULTA_ROSTRO_MS    = 1500;
+const unsigned long SALUDO_MS             = 2500;
+const unsigned long AVISO_MS              = 2500;
+const int           LONGITUD_LCD          = 16;
 
 // ===== ESTRUCTURAS =====
 struct SolicitudLlave {
@@ -89,8 +98,13 @@ EstadoDispensador estado;
 
 unsigned long ultimaPeticionMs         = 0;
 unsigned long ultimaConsultaEscaneoMs  = 0;
+unsigned long ultimaConsultaRostroMs   = 0;
 unsigned long ultimaAccionMs           = 0;
 bool modoEscaneo = false;
+
+// Rostro que avisó el ESP32-CAM. "ultimoSeqSaludado" evita repetir el saludo.
+String personaReconocida = "";
+long   ultimoSeqSaludado = -1;
 
 String bufferAula, bufferPin;
 int pantalla = 0;   // 0 inicio, 1 aula, 2 PIN, 3 girando, 4 entregado, 5 error
@@ -116,6 +130,12 @@ void dibujarInicio(); void dibujarAula(); void dibujarPin(); void dibujarGirando
 void dibujarEntregado(const String& aula); void dibujarError(const String& mensaje);
 void procesarTecla(char tecla);
 void resetSesion();
+// Flujo por rostro
+String recortarLCD(const String& texto);
+void avisar(const String& l1, const String& l2);
+void saludar(const String& persona);
+bool consultarRostro();
+bool solicitarLlave(const String& numero);
 
 // ===== SETUP =====
 void setup() {
@@ -152,13 +172,20 @@ void setup() {
 void loop() {
   mantenerWiFi();
 
-  if (WiFi.status() == WL_CONNECTED && millis() - ultimaPeticionMs > CONSULTA_SOLICITUD_MS) {
-    ultimaPeticionMs = millis();
-    peticionSolicitud();
+  // En reposo se consulta la web (solicitud) y la cámara (rostro reconocido).
+  if (WiFi.status() == WL_CONNECTED && pantalla == 0) {
+    if (millis() - ultimaPeticionMs > CONSULTA_SOLICITUD_MS) {
+      ultimaPeticionMs = millis();
+      peticionSolicitud();
+    }
+    // Si hay un pedido hecho desde la web, ese tiene prioridad sobre el rostro.
+    if (!solicitud.activa && !modoEscaneo &&
+        millis() - ultimaConsultaRostroMs > CONSULTA_ROSTRO_MS) {
+      ultimaConsultaRostroMs = millis();
+      consultarRostro();
+    }
+    gestionarEscaneo();
   }
-
-  // Modo escaneo: solo en pantalla de inicio (motor quieto)
-  if (pantalla == 0) gestionarEscaneo();
 
   char tecla = teclado.getKey();
   if (tecla) {
@@ -400,18 +427,121 @@ void gestionarEscaneo() {
   dibujarInicio();
 }
 
+// ===== FLUJO POR ROSTRO =====
+// El ESP32-CAM manda cada rostro autorizado al servidor; acá se consulta cuál
+// fue el último y se saluda. Después la persona escribe el número de aula.
+String recortarLCD(const String& texto) {
+  return texto.length() <= LONGITUD_LCD ? texto : texto.substring(0, LONGITUD_LCD);
+}
+
+void avisar(const String& l1, const String& l2) {
+  mostrarEnLCD(recortarLCD(l1), recortarLCD(l2));
+  ledRojo();
+  delay(AVISO_MS);
+  if (personaReconocida.length() > 0) {
+    bufferAula = "";
+    pantalla = 1;
+    dibujarAula();
+  } else {
+    resetSesion();
+  }
+  ultimaAccionMs = millis();
+}
+
+void saludar(const String& persona) {
+  Serial.println("Rostro reconocido: " + persona);
+  personaReconocida = persona;
+  mostrarEnLCD("Bienvenido", recortarLCD(persona));
+  ledVerde();
+  delay(SALUDO_MS);
+  bufferAula = "";
+  bufferPin = "";
+  estado.intentosPin = 0;
+  pantalla = 1;
+  dibujarAula();
+  ultimaAccionMs = millis();
+}
+
+bool consultarRostro() {
+  String json = peticionHTTP("/dispensador/reconocido", "GET", "", "");
+  if (json.isEmpty()) return false;
+
+  StaticJsonDocument<256> doc;
+  if (deserializeJson(doc, json)) return false;
+  if (!(doc["reconocido"] | false)) return false;
+
+  String persona = doc["persona"].as<String>();
+  long seq = doc["seq"] | 0;
+  if (persona.isEmpty()) return false;
+  // Misma persona y mismo aviso: no repetir el saludo.
+  if (seq == ultimoSeqSaludado && persona.equalsIgnoreCase(personaReconocida)) return false;
+
+  ultimoSeqSaludado = seq;
+  saludar(persona);
+  return true;
+}
+
+bool solicitarLlave(const String& numero) {
+  String json = peticionHTTP("/dispensador/llave/" + numero, "GET", "", "");
+  if (json.isEmpty()) {
+    avisar("Sin conexion", "Reintente");
+    return false;
+  }
+
+  DynamicJsonDocument doc(1024);
+  if (deserializeJson(doc, json)) {
+    avisar("Error", "Respuesta invalida");
+    return false;
+  }
+
+  // El servidor consulta la base: aula existente, activa y llave no prestada.
+  if (!(doc["ok"] | false)) {
+    avisar("No disponible", doc["error"] | "Aula invalida");
+    return false;
+  }
+  if (!(doc["disponible"] | false)) {
+    avisar("Llave no", "disponible");
+    return false;
+  }
+
+  JsonArray lista = doc["uids"].as<JsonArray>();
+  if (lista.isNull() || lista.size() == 0) {
+    avisar("Llave sin tag", "Avisa al admin");
+    return false;
+  }
+
+  solicitud = SolicitudLlave();
+  solicitud.activa      = true;
+  solicitud.aulaId      = doc["aula_id"] | numero.toInt();
+  solicitud.aulaNombre  = doc["aula_nombre"].as<String>();
+  solicitud.persona     = personaReconocida;
+  solicitud.requierePin = false;
+  for (JsonVariant v : lista) {
+    if (solicitud.nRfids >= MAX_TAGS) break;
+    solicitud.rfids[solicitud.nRfids++] = v.as<String>();
+  }
+
+  Serial.printf("Llave pedida: aula=%d (%s) tags=%d persona=%s\n",
+                solicitud.aulaId, solicitud.aulaNombre.c_str(),
+                solicitud.nRfids, solicitud.persona.c_str());
+  pantalla = 3;
+  dibujarGirando();
+  buscarYLlevarLlave();
+  return true;
+}
+
 // ===== PANTALLAS =====
 void dibujarInicio() {
-  mostrarEnLCD("Dispensador", "Listo");
+  mostrarEnLCD("Llavero ETEC", "Mire la camara");
   ledAzul();
 }
-void dibujarAula() { mostrarEnLCD("Ingrese nro aula", "Aula:" + bufferAula + "  #"); }
+void dibujarAula() { mostrarEnLCD("Nro de aula", "Aula:" + bufferAula + "  #"); }
 void dibujarPin() {
   String oculto(bufferPin.length(), '*');
   mostrarEnLCD("Ingrese PIN:", oculto + " #");
 }
 void dibujarGirando() {
-  mostrarEnLCD("Buscando llave", "Aula " + String(solicitud.aulaId));
+  mostrarEnLCD("Buscando llave", recortarLCD(solicitud.aulaNombre));
   ledAmbar();
 }
 void dibujarEntregado(const String& aula) {
@@ -449,19 +579,33 @@ void procesarTecla(char tecla) {
         }
       } else if (tecla == '#') {
         if (bufferAula.length() == 0) break;
-        if (bufferAula.toInt() == solicitud.aulaId) {
-          pantalla = 2;
-          bufferPin = "";
-          dibujarPin();
+        if (solicitud.activa && solicitud.nRfids > 0) {
+          // Pedido hecho desde la web: ya está validado y el préstamo registrado.
+          if (bufferAula.toInt() == solicitud.aulaId) {
+            if (solicitud.requierePin) {
+              pantalla = 2;
+              bufferPin = "";
+              dibujarPin();
+            } else {
+              pantalla = 3;
+              dibujarGirando();
+              buscarYLlevarLlave();
+            }
+          } else {
+            dibujarError("Aula invalida");
+            delay(1500);
+            bufferAula = "";
+            dibujarAula();
+          }
         } else {
-          dibujarError("Aula invalida");
-          delay(1500);
-          bufferAula = "";
-          dibujarAula();
+          // Flujo por rostro: se consulta disponibilidad y se dispensa.
+          solicitarLlave(bufferAula);
         }
       } else if (tecla == '*') {
         bufferAula = "";
         dibujarAula();
+      } else if (tecla == 'D') {
+        resetSesion();
       }
       break;
 
@@ -515,6 +659,7 @@ void procesarTecla(char tecla) {
 void resetSesion() {
   detenerMotor();
   solicitud = SolicitudLlave();
+  personaReconocida = "";
   estado.intentosPin = 0;
   bufferAula = "";
   bufferPin  = "";
@@ -577,7 +722,7 @@ bool buscarYLlevarLlave() {
   notificarEvento("encontrada", "posicionada");
 
   pantalla = 4;
-  dibujarEntregado("Aula " + String(solicitud.aulaId));
+  dibujarEntregado(solicitud.aulaNombre);
   unsigned long tRetiro = millis();
   while (millis() - tRetiro < TIEMPO_RETIRO_MS) {
     if (teclado.getKey()) break;

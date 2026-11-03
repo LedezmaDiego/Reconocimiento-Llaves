@@ -1,11 +1,14 @@
 import asyncio
 import os
 import time
-from fastapi import APIRouter, Request, HTTPException
+from io import BytesIO
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File
 from fastapi.responses import Response, JSONResponse, FileResponse
+from PIL import Image, ImageOps
 
 from config import (REGISTRO_TIMEOUT_S, FOTO_RECIENTE_S, FOTOS_LOTE_DEFECTO,
-                    FOTOS_LOTE_MAX, ESPERA_ENTRE_FOTOS_S)
+                    FOTOS_LOTE_MAX, ESPERA_ENTRE_FOTOS_S, MAX_BYTES_SUBIDA,
+                    LADO_MAX_SUBIDA)
 from estado import (ULTIMA_FOTO, ULTIMO_RESULTADO, MODO, AVISOS, BASE_EMBEDDINGS, LOCK_BASE, modo_actual)
 from fotos import guardar_pendiente, archivos_de, pendientes_de, ruta_foto_de
 from logs import log
@@ -56,6 +59,28 @@ async def guardar_foto(request: Request):
         return JSONResponse(status_code=400, content={
             "ok": False, "mensaje": "No hay una foto reciente. ¿La placa está enviando? Inicia la captura."})
     res = guardar_pendiente(usuario, ULTIMA_FOTO["bytes"])
+    return JSONResponse(status_code=200 if res["ok"] else 422, content=res)
+
+@router.post("/subir_foto")
+async def subir_foto(request: Request, archivo: UploadFile = File(...)):
+    """Sube una foto desde la computadora y la deja pendiente de verificación."""
+    usuario = autenticar(request)
+    datos = await archivo.read(MAX_BYTES_SUBIDA + 1)
+    if len(datos) > MAX_BYTES_SUBIDA:
+        raise HTTPException(status_code=413,
+                            detail=f"La imagen supera los {MAX_BYTES_SUBIDA // (1024 * 1024)} MB.")
+    if not datos:
+        raise HTTPException(status_code=400, detail="El archivo está vacío.")
+    try:
+        imagen = ImageOps.exif_transpose(Image.open(BytesIO(datos)))
+        imagen = imagen.convert("RGB")
+        imagen.thumbnail((LADO_MAX_SUBIDA, LADO_MAX_SUBIDA))
+        salida = BytesIO()
+        imagen.save(salida, "JPEG", quality=90)
+    except Exception:
+        raise HTTPException(status_code=400,
+                            detail="El archivo no es una imagen válida (JPEG, PNG o WebP).") from None
+    res = guardar_pendiente(usuario, salida.getvalue())
     return JSONResponse(status_code=200 if res["ok"] else 422, content=res)
 
 async def _esperar_frame_nuevo(ts_anterior: float, timeout: float) -> bool:
